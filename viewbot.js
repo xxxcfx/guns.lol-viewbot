@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, MessageFlags, AttachmentBuilder } = require('discord.js');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -291,14 +291,14 @@ client.on('interactionCreate', async interaction => {
 
         let successful = 0;
         let failed = 0;
-        let logBatches = [];
+        let logLines = [];  // will hold all log strings for the file
 
         try {
             for (let i = 0; i < viewsToDo; i++) {
                 console.log(`[VIEWS] Starting view #${i + 1}/${viewsToDo}`);
                 const result = await sendViewWithFallback(targetUrl, (logEntry) => {
-                    const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Type:** ${logEntry.type} | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'}`;
-                    logBatches.push(line);
+                    const line = `${logEntry.timestamp} | IP: ${logEntry.ip} | Type: ${logEntry.type} | Status: ${logEntry.status} | Success: ${logEntry.success ? '✅' : '❌'}`;
+                    logLines.push(line);
                 });
 
                 if (result.success) {
@@ -333,39 +333,22 @@ client.on('interactionCreate', async interaction => {
                 } catch (e) {
                     console.error(`[VIEWS] Failed to update embed: ${e.message}`);
                 }
-
-                if (logBatches.length >= 10) {
-                    try {
-                        const batch = logBatches.join('\n');
-                        const logEmbed = new EmbedBuilder()
-                            .setColor(0x3498DB)
-                            .setDescription(batch.slice(0, 4000))
-                            .setTimestamp();
-                        await logChannel.send({ embeds: [logEmbed] });
-                        console.log(`[VIEWS] Sent batch of ${logBatches.length} logs`);
-                    } catch (e) {
-                        console.error(`[VIEWS] Failed to send batch logs: ${e.message}`);
-                    }
-                    logBatches = [];
-                }
             }
         } catch (e) {
             console.error(`[FATAL] Loop error: ${e.message}`);
             try { await reply.edit({ content: `❌ Fatal error: ${e.message}` }); } catch (_) {}
         }
 
-        // Send remaining logs
-        if (logBatches.length > 0) {
+        // Send the entire log as a text file
+        if (logLines.length > 0) {
             try {
-                const batch = logBatches.join('\n');
-                const logEmbed = new EmbedBuilder()
-                    .setColor(0x3498DB)
-                    .setDescription(batch.slice(0, 4000))
-                    .setTimestamp();
-                await logChannel.send({ embeds: [logEmbed] });
-                console.log(`[VIEWS] Sent final batch of ${logBatches.length} logs`);
+                const fileContent = logLines.join('\n');
+                const logFile = Buffer.from(fileContent, 'utf8');
+                const attachment = new AttachmentBuilder(logFile, { name: 'logs.txt' });
+                await logChannel.send({ files: [attachment] });
+                console.log(`[VIEWS] Sent log file with ${logLines.length} lines`);
             } catch (e) {
-                console.error(`[VIEWS] Failed to send final logs: ${e.message}`);
+                console.error(`[VIEWS] Failed to send log file: ${e.message}`);
             }
         }
 
