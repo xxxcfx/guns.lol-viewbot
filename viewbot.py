@@ -1,177 +1,162 @@
-import os
-import random
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import requests
+const Proxifly = require('proxifly');
+const axios = require('axios');
+const fs = require('fs');
 
-# ========== CONFIGURATION ==========
-TARGET_USERNAME = "f7tv"
-TARGET_URL = f"https://guns.lol/{TARGET_USERNAME}"
-TOTAL_VIEWS = int(os.getenv("TOTAL_VIEWS", "500"))
-WORKERS = int(os.getenv("WORKERS", "1"))
-DELAY = float(os.getenv("DELAY", "5"))
-RETRIES = int(os.getenv("RETRIES", "3"))
+// ========== CONFIGURATION ==========
+const TARGET_USERNAME = 'f7tv';
+const TARGET_URL = `https://guns.lol/${TARGET_USERNAME}`;
 
-# Proxifly settings
-PROXIFLY_API_KEY = os.getenv("PROXIFLY_API_KEY", "3wjHnRJ6pgxMDrwvpkykFSv3jRGNnSqh4VTbJ8kfSBZp")
-PROXIFLY_API_URL = "https://api.proxifly.dev/v1/proxies"
-PROXY_REFRESH_INTERVAL = int(os.getenv("PROXY_REFRESH_INTERVAL", "50"))
+const TOTAL_VIEWS = parseInt(process.env.TOTAL_VIEWS || '200');
+const DELAY_MS = parseInt(process.env.DELAY_MS || '5000'); // 5 seconds
+const RETRIES = parseInt(process.env.RETRIES || '3');
+const PROXY_REFRESH_INTERVAL = parseInt(process.env.PROXY_REFRESH_INTERVAL || '20'); // refresh proxies every 20 views
 
-# ========== GLOBALS ==========
-proxy_pool = []
-successful_views = 0
-failed_views = 0
-lock = threading.Lock()
-stop_flag = threading.Event()
-request_counter = 0
+const PROXIFLY_API_KEY = process.env.PROXIFLY_API_KEY || '3wjHnRJ6pgxMDrwvpkykFSv3jRGNnSqh4VTbJ8kfSBZp';
 
-# ========== USER AGENTS ==========
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-]
+// ========== STATE ==========
+let proxyPool = [];
+let successfulViews = 0;
+let failedViews = 0;
+let requestCount = 0;
+let stopFlag = false;
 
-# ========== PROXY LOADING (Proxifly) ==========
-def fetch_proxies():
-    """Fetch proxy list from Proxifly API."""
-    try:
-        params = {
-            "api_key": PROXIFLY_API_KEY,
-            "limit": 100,          # Max proxies per request
-            "protocol": "http",    # or "socks5" if needed
+// ========== USER AGENTS ==========
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+];
+
+// ========== PROXY FETCHING ==========
+async function fetchProxies() {
+    try {
+        const proxifly = new Proxifly({ apiKey: PROXIFLY_API_KEY });
+        const result = await proxifly.getProxy({
+            countries: ['US', 'RU'],
+            protocol: ['http', 'socks4'],
+            quantity: 20,
+            https: true
+        });
+        // Result is an array of objects: [ { ip, port, protocol, ... }, ... ]
+        const proxies = result.map(p => `${p.protocol}://${p.ip}:${p.port}`);
+        return proxies;
+    } catch (err) {
+        console.error(`[!] Proxifly fetch error: ${err.message}`);
+        return [];
+    }
+}
+
+async function refreshProxyPool() {
+    const newProxies = await fetchProxies();
+    if (newProxies.length > 0) {
+        proxyPool = newProxies;
+        console.log(`[i] Proxy pool refreshed: ${proxyPool.length} proxies`);
+    } else {
+        console.log('[!] No proxies returned – keeping current pool.');
+    }
+    // Shuffle for randomness
+    proxyPool.sort(() => Math.random() - 0.5);
+}
+
+// ========== HELPER ==========
+function extractIp(proxyStr) {
+    if (!proxyStr) return 'direct';
+    const parts = proxyStr.split('://');
+    const ipPort = parts[1] || parts[0];
+    return ipPort.split(':')[0];
+}
+
+// ========== SINGLE VIEW REQUEST ==========
+async function sendView() {
+    const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
+    const ip = extractIp(proxy);
+
+    const config = {
+        headers: {
+            'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://guns.lol/',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        },
+        proxy: proxy ? { host: proxy.split('://')[1].split(':')[0], port: parseInt(proxy.split(':')[2]) } : undefined,
+        timeout: 15000,
+    };
+
+    for (let attempt = 0; attempt < RETRIES; attempt++) {
+        try {
+            const resp = await axios.get(TARGET_URL, config);
+            if (resp.status === 200) {
+                return { success: true, ip };
+            } else if (resp.status === 429) {
+                const wait = Math.min(Math.pow(2, attempt) + Math.random(), 10) * 1000;
+                await sleep(wait);
+                continue;
+            } else {
+                return { success: false, ip };
+            }
+        } catch (err) {
+            await sleep(1000);
         }
-        resp = requests.get(PROXIFLY_API_URL, params=params, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            # Proxifly returns an array of objects: [{"ip":"...","port":...,"protocol":"http"}, ...]
-            proxies = []
-            for p in data:
-                if "ip" in p and "port" in p:
-                    protocol = p.get("protocol", "http")
-                    proxy_str = f"{protocol}://{p['ip']}:{p['port']}"
-                    proxies.append(proxy_str)
-            return proxies
-        else:
-            print(f"[!] Proxifly API returned status {resp.status_code}: {resp.text[:100]}")
-            return []
-    except Exception as e:
-        print(f"[!] Failed to fetch proxies from Proxifly: {e}")
-        return []
+    }
+    return { success: false, ip };
+}
 
-def refresh_proxy_pool():
-    global proxy_pool
-    new_proxies = fetch_proxies()
-    if new_proxies:
-        proxy_pool = new_proxies
-        print(f"[i] Proxifly pool refreshed: {len(proxy_pool)} proxies loaded")
-    else:
-        print("[!] Proxifly returned empty list. Keeping current pool.")
-    random.shuffle(proxy_pool)
+// ========== SLEEP ==========
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-# ========== HELPER ==========
-def extract_ip(proxy_str):
-    if not proxy_str:
-        return "direct"
-    if "://" in proxy_str:
-        ip_port = proxy_str.split("://")[1]
-    else:
-        ip_port = proxy_str
-    if ":" in ip_port:
-        ip = ip_port.split(":")[0]
-    else:
-        ip = ip_port
-    return ip
+// ========== MAIN LOOP ==========
+async function main() {
+    console.log('='.repeat(60));
+    console.log('🎯 guns.lol View Bot (Node.js + Proxifly)');
+    console.log(`   Target: ${TARGET_URL}`);
+    console.log(`   Goal: ${TOTAL_VIEWS} views`);
+    console.log(`   Delay: ${DELAY_MS/1000}s`);
+    console.log(`   Proxifly API Key: ${PROXIFLY_API_KEY.slice(0, 8)}...`);
+    console.log('='.repeat(60));
 
-# ========== SINGLE VIEW REQUEST ==========
-def send_view():
-    global proxy_pool
-    proxy = None
-    proxy_ip = "direct"
-    if proxy_pool:
-        proxy = random.choice(proxy_pool)
-        proxy_ip = extract_ip(proxy)
-    
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://guns.lol/",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+    console.log('[i] Fetching initial proxy pool...');
+    await refreshProxyPool();
+    if (proxyPool.length === 0) {
+        console.log('[!] Warning: No proxies loaded. Continuing without proxies.');
     }
 
-    for attempt in range(RETRIES):
-        try:
-            resp = requests.get(TARGET_URL, headers=headers, proxies=proxies, timeout=15)
-            if resp.status_code == 200:
-                return (True, proxy_ip)
-            elif resp.status_code == 429:
-                wait = min(2 ** attempt + random.uniform(0, 1), 10)
-                time.sleep(wait)
-                continue
-            else:
-                return (False, proxy_ip)
-        except Exception as e:
-            time.sleep(1)
-            continue
-    return (False, proxy_ip)
+    while (!stopFlag && successfulViews < TOTAL_VIEWS) {
+        // Refresh proxies periodically
+        requestCount++;
+        if (requestCount % PROXY_REFRESH_INTERVAL === 0) {
+            console.log('[i] Refreshing proxy pool...');
+            await refreshProxyPool();
+        }
 
-# ========== WORKER ==========
-def worker_thread(worker_id):
-    global successful_views, failed_views, request_counter
-    while not stop_flag.is_set():
-        with lock:
-            if successful_views >= TOTAL_VIEWS:
-                stop_flag.set()
-                return
-        with lock:
-            request_counter += 1
-            if request_counter % PROXY_REFRESH_INTERVAL == 0:
-                refresh_proxy_pool()
+        const { success, ip } = await sendView();
+        if (success) {
+            successfulViews++;
+            console.log(`✅ View #${successfulViews} added | IP: ${ip} | Next in ${DELAY_MS/1000}s`);
+        } else {
+            failedViews++;
+            console.log(`❌ Failed (total fails: ${failedViews}) | IP: ${ip} | Next in ${DELAY_MS/1000}s`);
+        }
 
-        success, proxy_ip = send_view()
-        with lock:
-            if success:
-                successful_views += 1
-                print(f"[Worker {worker_id}] ✅ View #{successful_views} added | IP: {proxy_ip} | Next in {DELAY}s")
-            else:
-                failed_views += 1
-                print(f"[Worker {worker_id}] ❌ Failed (total fails: {failed_views}) | IP: {proxy_ip} | Next in {DELAY}s")
-        if successful_views >= TOTAL_VIEWS:
-            stop_flag.set()
-            return
-        time.sleep(DELAY)
+        if (successfulViews >= TOTAL_VIEWS) {
+            break;
+        }
+        await sleep(DELAY_MS);
+    }
 
-# ========== MAIN ==========
-def main():
-    global successful_views, failed_views
-    print("=" * 60)
-    print("🎯 guns.lol View Bot (Proxifly Residential Proxies)")
-    print(f"   Target: {TARGET_URL}")
-    print(f"   Goal: {TOTAL_VIEWS} views")
-    print(f"   Delay: {DELAY}s between requests")
-    print(f"   Proxifly API Key: {PROXIFLY_API_KEY[:8]}...")
-    print("=" * 60)
+    console.log('\n' + '='.repeat(60));
+    console.log('🏁 Finished!');
+    console.log(`   Successful views added: ${successfulViews}`);
+    console.log(`   Failed attempts: ${failedViews}`);
+    console.log('='.repeat(60));
+    process.exit(0);
+}
 
-    print("[i] Fetching initial proxy pool from Proxifly...")
-    refresh_proxy_pool()
-    if not proxy_pool:
-        print("[!] Warning: No proxies loaded. Continuing without proxies.")
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-        futures = [executor.submit(worker_thread, i) for i in range(WORKERS)]
-        stop_flag.wait()
-        executor.shutdown(wait=False)
-
-    print("\n" + "=" * 60)
-    print("🏁 Finished!")
-    print(f"   Successful views added: {successful_views}")
-    print(f"   Failed attempts: {failed_views}")
-    print("=" * 60)
-
-if __name__ == "__main__":
-    main()
+main().catch(err => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+});
