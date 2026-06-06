@@ -9,11 +9,10 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
 const ALLOWED_CHANNEL_ID = '1512808669522165832';
 const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 1000; // 1 second
-const RETRIES = 2;
+const DELAY_BETWEEN_VIEWS = 500;  // 0.5 seconds between views
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
-const PER_REQUEST_TIMEOUT = 5000; // 5 seconds
+const PER_REQUEST_TIMEOUT = 8000;  // 8 seconds
 
 // ========== STATE ==========
 let proxyPool = [];
@@ -44,26 +43,28 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== VIEW REQUEST ==========
-async function sendView(targetUrl, onLog, useProxy = true) {
-    let proxy = null;
-    if (useProxy && proxyPool.length > 0) {
-        proxy = proxyPool[Math.floor(Math.random() * proxyPool.length)];
+// ========== VIEW REQUEST WITH PROXY + DIRECT FALLBACK ==========
+async function sendView(targetUrl, onLog) {
+    // Decide order: try proxy first (if available), then fallback to direct
+    const attempts = [];
+    if (proxyPool.length > 0) {
+        const proxy = proxyPool[Math.floor(Math.random() * proxyPool.length)];
+        attempts.push({ proxy, type: 'proxy' });
     }
-    const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
+    // Always add direct as last resort
+    attempts.push({ proxy: null, type: 'direct' });
 
-    let proxyAgent = null;
-    if (proxy) {
-        proxyAgent = new HttpsProxyAgent(proxy);
-    }
+    for (const { proxy, type } of attempts) {
+        const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
+        let proxyAgent = null;
+        if (proxy) proxyAgent = new HttpsProxyAgent(proxy);
 
-    const userAgent = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    ][Math.floor(Math.random() * 3)];
+        const userAgent = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        ][Math.floor(Math.random() * 3)];
 
-    for (let attempt = 0; attempt < RETRIES; attempt++) {
         const config = {
             headers: {
                 'User-Agent': userAgent,
@@ -76,7 +77,7 @@ async function sendView(targetUrl, onLog, useProxy = true) {
             httpsAgent: proxyAgent,
             timeout: PER_REQUEST_TIMEOUT,
             maxRedirects: 0,
-            validateStatus: () => true, // Accept any status code
+            validateStatus: () => true,
         };
 
         try {
@@ -88,21 +89,24 @@ async function sendView(targetUrl, onLog, useProxy = true) {
 
             const log = {
                 proxy: proxy || 'none', ip, status: resp.status, success: true,
-                attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
+                attempt: 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
+                type,
             };
             if (onLog) onLog(log);
             return { success: true, ip, proxy, status: resp.status };
         } catch (err) {
             const log = {
                 proxy: proxy || 'none', ip, status: err.message === 'Hard timeout' ? 'timeout' : 'error', success: false,
-                attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: 'error',
+                attempt: 1, timestamp: new Date().toISOString(), userAgent: 'error',
+                type,
             };
             if (onLog) onLog(log);
-            console.error(`   [ERROR] Attempt ${attempt + 1}: ${err.message}`);
-            if (attempt < RETRIES - 1) await sleep(2000);
+            console.error(`   [${type}] Failed: ${err.message}`);
+            // If proxy fails, continue to next attempt (direct)
+            if (type === 'direct') break; // last resort already, break out
         }
     }
-    return { success: false, ip, proxy, status: 'error' };
+    return { success: false, ip: 'direct', proxy: null, status: 'error' };
 }
 
 function sleep(ms) {
@@ -118,7 +122,7 @@ client.once('ready', () => {
     console.log(`[✓] Logged in as ${client.user.tag}`);
     loadDailyViews();
     proxyPool = loadProxiesFromFile();
-    if (proxyPool.length === 0) console.warn('[!] No proxies loaded – will use direct connection.');
+    if (proxyPool.length === 0) console.warn('[!] No proxies loaded – will use direct connection only.');
 });
 
 client.on('interactionCreate', async interaction => {
@@ -137,7 +141,7 @@ client.on('interactionCreate', async interaction => {
 
     // ========== /views ==========
     if (commandName === 'views') {
-        await interaction.deferReply(); // Public reply (no flags)
+        await interaction.deferReply(); // Public reply
 
         const targetUser = interaction.options.getString('user');
         const amount = interaction.options.getInteger('amount');
@@ -174,7 +178,7 @@ client.on('interactionCreate', async interaction => {
 
         const reply = await interaction.editReply({ embeds: [embed] });
 
-        // Header log (with try/catch to avoid breaking loop)
+        // Header log (protected)
         try {
             const headerEmbed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -184,65 +188,72 @@ client.on('interactionCreate', async interaction => {
                 .setTimestamp();
             await logChannel.send({ embeds: [headerEmbed] });
         } catch (e) {
-            console.error('[!] Failed to send header log:', e.message);
+            console.error('[!] Header log send failed:', e.message);
         }
 
         let successful = 0;
         let failed = 0;
         let logBatches = [];
-        const useProxy = proxyPool.length > 0;
 
-        // Run the full loop – each iteration is protected
-        for (let i = 0; i < viewsToDo; i++) {
-            const result = await sendView(targetUrl, (logEntry) => {
-                const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
-                logBatches.push(line);
-            }, useProxy);
+        // Safe loop that catches any error to prevent crash
+        try {
+            for (let i = 0; i < viewsToDo; i++) {
+                const result = await sendView(targetUrl, (logEntry) => {
+                    const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt} | **Type:** ${logEntry.type}`;
+                    logBatches.push(line);
+                });
 
-            if (result.success) successful++;
-            else failed++;
+                if (result.success) successful++;
+                else failed++;
 
-            dailyViews[key] = (dailyViews[key] || 0) + 1;
-            saveDailyViews();
+                dailyViews[key] = (dailyViews[key] || 0) + 1;
+                saveDailyViews();
 
-            const statusText = result.success
-                ? `✅ View #${i + 1} added (status: ${result.status})`
-                : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+                const statusText = result.success
+                    ? `✅ View #${i + 1} added (status: ${result.status})`
+                    : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
 
-            try {
-                const updatedEmbed = EmbedBuilder.from(embed)
-                    .setFields(
-                        { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
-                        { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
-                        { name: '📊 Progress', value: `${i + 1}/${viewsToDo}`, inline: false },
-                        { name: '✅ Successful', value: `${successful}`, inline: true },
-                        { name: '❌ Failed', value: `${failed}`, inline: true },
-                        { name: '⏱️ Status', value: statusText, inline: false },
-                    );
-                await reply.edit({ embeds: [updatedEmbed] });
-            } catch (e) {
-                console.error('[!] Failed to update embed:', e.message);
-            }
-
-            // Batch log sends (with try/catch)
-            if (logBatches.length >= 10) {
                 try {
-                    const batch = logBatches.join('\n');
-                    const logEmbed = new EmbedBuilder()
-                        .setColor(0x3498DB)
-                        .setDescription(batch.slice(0, 4000))
-                        .setTimestamp();
-                    await logChannel.send({ embeds: [logEmbed] });
+                    const updatedEmbed = EmbedBuilder.from(embed)
+                        .setFields(
+                            { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
+                            { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
+                            { name: '📊 Progress', value: `${i + 1}/${viewsToDo}`, inline: false },
+                            { name: '✅ Successful', value: `${successful}`, inline: true },
+                            { name: '❌ Failed', value: `${failed}`, inline: true },
+                            { name: '⏱️ Status', value: statusText, inline: false },
+                        );
+                    await reply.edit({ embeds: [updatedEmbed] });
                 } catch (e) {
-                    console.error('[!] Failed to send batch log:', e.message);
+                    console.error('[!] Embed update failed:', e.message);
                 }
-                logBatches = [];
-            }
 
-            if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
+                // Send batch logs safely
+                if (logBatches.length >= 10) {
+                    try {
+                        const batch = logBatches.join('\n');
+                        const logEmbed = new EmbedBuilder()
+                            .setColor(0x3498DB)
+                            .setDescription(batch.slice(0, 4000))
+                            .setTimestamp();
+                        await logChannel.send({ embeds: [logEmbed] });
+                    } catch (e) {
+                        console.error('[!] Batch log send failed:', e.message);
+                    }
+                    logBatches = [];
+                }
+
+                if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
+            }
+        } catch (e) {
+            // Catch any unexpected error from the loop itself
+            console.error('[FATAL] Loop error:', e);
+            try {
+                await reply.edit({ content: `❌ Fatal error: ${e.message}` });
+            } catch (_) {}
         }
 
-        // Send remaining logs
+        // Send remaining logs safely
         if (logBatches.length > 0) {
             try {
                 const batch = logBatches.join('\n');
@@ -252,7 +263,7 @@ client.on('interactionCreate', async interaction => {
                     .setTimestamp();
                 await logChannel.send({ embeds: [logEmbed] });
             } catch (e) {
-                console.error('[!] Failed to send final batch log:', e.message);
+                console.error('[!] Final log send failed:', e.message);
             }
         }
 
@@ -271,7 +282,7 @@ client.on('interactionCreate', async interaction => {
                 .setTimestamp();
             await logChannel.send({ embeds: [summaryEmbed] });
         } catch (e) {
-            console.error('[!] Failed to send summary log:', e.message);
+            console.error('[!] Summary log send failed:', e.message);
         }
 
         // Final embed (public)
@@ -289,13 +300,12 @@ client.on('interactionCreate', async interaction => {
                 );
             await reply.edit({ embeds: [finalEmbed] });
         } catch (e) {
-            console.error('[!] Failed to send final embed:', e.message);
+            console.error('[!] Final embed edit failed:', e.message);
         }
     }
 
-    // ========== /status, /proxycount, /help, /reset ==========
+    // ========== Other commands (unchanged) ==========
     else if (commandName === 'status') {
-        // ... (unchanged, but ensure ephemeral)
         const today = TODAY();
         const key = `${requester.id}_${today}`;
         const used = dailyViews[key] || 0;
