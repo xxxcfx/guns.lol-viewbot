@@ -1,12 +1,13 @@
 {
-  "name": "guns-lol-viewbot",
-  "version": "6.0.0",
-  "description": "guns.lol view bot using local http.txt proxies",
-  "main": "viewbot.js",
+  "name": "guns-lol-discord-bot",
+  "version": "2.0.0",
+  "description": "Discord bot for guns.lol view bot with extra commands",
+  "main": "bot.js",
   "scripts": {
-    "start": "node viewbot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
+    "discord.js": "^14.14.1",
     "axios": "^1.6.5",
     "http-proxy-agent": "^7.0.0",
     "https-proxy-agent": "^7.0.0"
