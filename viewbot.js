@@ -1,6 +1,6 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const axios = require('axios');
-const { HttpsProxyAgent } = require('https-proxy-agent'); // single agent works for both HTTP and HTTPS targets
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const fs = require('fs');
 const path = require('path');
 
@@ -13,6 +13,7 @@ const DELAY_BETWEEN_VIEWS = 1000;
 const RETRIES = 3;
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
+const PER_REQUEST_TIMEOUT = 10000; // 10 seconds hard limit per request
 
 // ========== STATE ==========
 let proxyPool = [];
@@ -43,15 +44,13 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== VIEW REQUEST (fixed proxy agent) ==========
+// ========== VIEW REQUEST WITH HARD TIMEOUT ==========
 async function sendView(targetUrl, onLog) {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
 
-    // Always use HttpsProxyAgent because target is HTTPS
     let proxyAgent = null;
     if (proxy) {
-        // For HTTPS targets, HttpsProxyAgent works with both HTTP and HTTPS proxies.
         proxyAgent = new HttpsProxyAgent(proxy);
     }
 
@@ -61,23 +60,28 @@ async function sendView(targetUrl, onLog) {
         'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
     ][Math.floor(Math.random() * 3)];
 
-    const config = {
-        headers: {
-            'User-Agent': userAgent,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Referer': 'https://guns.lol/',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-        },
-        httpsAgent: proxyAgent,  // use HttpsProxyAgent
-        httpAgent: undefined,    // not needed
-        timeout: 15000,
-    };
-
     for (let attempt = 0; attempt < RETRIES; attempt++) {
+        const config = {
+            headers: {
+                'User-Agent': userAgent,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://guns.lol/',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+            },
+            httpsAgent: proxyAgent,
+            timeout: PER_REQUEST_TIMEOUT, // still set axios timeout as fallback
+        };
+
         try {
-            const resp = await axios.get(targetUrl, config);
+            // Wrap axios in a hard timeout via Promise.race
+            const requestPromise = axios.get(targetUrl, config);
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Hard timeout')), PER_REQUEST_TIMEOUT + 2000) // give axios a bit extra
+            );
+            const resp = await Promise.race([requestPromise, timeoutPromise]);
+
             const log = {
                 proxy: proxy || 'none', ip, status: resp.status, success: resp.status === 200,
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
@@ -92,7 +96,7 @@ async function sendView(targetUrl, onLog) {
             return { success: false, ip, proxy, status: resp.status };
         } catch (err) {
             const log = {
-                proxy: proxy || 'none', ip, status: 'error', success: false,
+                proxy: proxy || 'none', ip, status: err.message === 'Hard timeout' ? 'timeout' : 'error', success: false,
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: 'error',
             };
             if (onLog) onLog(log);
@@ -185,47 +189,59 @@ client.on('interactionCreate', async interaction => {
         let failed = 0;
         let logBatches = [];
 
-        for (let i = 0; i < viewsToDo; i++) {
-            const result = await sendView(targetUrl, (logEntry) => {
-                const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
-                logBatches.push(line);
-            });
+        try {
+            for (let i = 0; i < viewsToDo; i++) {
+                const result = await sendView(targetUrl, (logEntry) => {
+                    const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
+                    logBatches.push(line);
+                });
 
-            if (result.success) successful++;
-            else failed++;
+                if (result.success) successful++;
+                else failed++;
 
-            dailyViews[key] = (dailyViews[key] || 0) + 1;
-            saveDailyViews();
+                dailyViews[key] = (dailyViews[key] || 0) + 1;
+                saveDailyViews();
 
-            const statusText = result.success
-                ? `✅ View #${i + 1} added (IP: ${result.ip})`
-                : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+                const statusText = result.success
+                    ? `✅ View #${i + 1} added (IP: ${result.ip})`
+                    : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
 
-            const updatedEmbed = EmbedBuilder.from(embed)
-                .setFields(
-                    { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
-                    { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
-                    { name: '📊 Progress', value: `${i + 1}/${viewsToDo}`, inline: false },
-                    { name: '✅ Successful', value: `${successful}`, inline: true },
-                    { name: '❌ Failed', value: `${failed}`, inline: true },
-                    { name: '⏱️ Status', value: statusText, inline: false },
-                );
-            await reply.edit({ embeds: [updatedEmbed] });
+                const updatedEmbed = EmbedBuilder.from(embed)
+                    .setFields(
+                        { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
+                        { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
+                        { name: '📊 Progress', value: `${i + 1}/${viewsToDo}`, inline: false },
+                        { name: '✅ Successful', value: `${successful}`, inline: true },
+                        { name: '❌ Failed', value: `${failed}`, inline: true },
+                        { name: '⏱️ Status', value: statusText, inline: false },
+                    );
+                await reply.edit({ embeds: [updatedEmbed] });
 
-            if (logBatches.length >= 10) {
-                const batch = logBatches.join('\n');
-                const logEmbed = new EmbedBuilder()
-                    .setColor(0x3498DB)
-                    .setDescription(batch.slice(0, 4000))
-                    .setTimestamp();
-                await logChannel.send({ embeds: [logEmbed] });
-                logBatches = [];
+                if (logBatches.length >= 10) {
+                    const batch = logBatches.join('\n');
+                    const logEmbed = new EmbedBuilder()
+                        .setColor(0x3498DB)
+                        .setDescription(batch.slice(0, 4000))
+                        .setTimestamp();
+                    await logChannel.send({ embeds: [logEmbed] });
+                    logBatches = [];
+                }
+
+                if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
             }
-
-            if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
+        } catch (err) {
+            console.error('[FATAL] View loop error:', err);
+            // Even on fatal error, try to update embed
+            const errorEmbed = EmbedBuilder.from(embed)
+                .setColor(0xFF0000)
+                .setTitle('❌ View Bot – Crashed')
+                .setDescription(`Fatal error: ${err.message}`)
+                .setTimestamp();
+            await reply.edit({ embeds: [errorEmbed] }).catch(() => {});
+            await logChannel.send({ content: `❌ **FATAL ERROR:** ${err.message}`, embeds: [] });
         }
 
-        // Remaining logs
+        // Send remaining logs
         if (logBatches.length > 0) {
             const batch = logBatches.join('\n');
             const logEmbed = new EmbedBuilder()
