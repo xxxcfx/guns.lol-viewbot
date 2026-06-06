@@ -11,13 +11,12 @@ const TOTAL_VIEWS = parseInt(process.env.TOTAL_VIEWS || '200');
 const DELAY_MS = parseInt(process.env.DELAY_MS || '5000'); // 5 seconds
 const RETRIES = parseInt(process.env.RETRIES || '3');
 
-const PROXY_FILE = 'http.txt';  // File must be in the same directory
+const PROXY_FILE = 'http.txt';  // One proxy per line: ip:port
 
 // ========== STATE ==========
 let proxyPool = [];
 let successfulViews = 0;
 let failedViews = 0;
-let requestCount = 0;
 let stopFlag = false;
 
 // ========== USER AGENTS ==========
@@ -33,22 +32,20 @@ function loadProxiesFromFile() {
         const content = fs.readFileSync(PROXY_FILE, 'utf8');
         const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
 
-        // Each line must be "ip:port"
         const proxies = lines
             .map(line => line.trim())
             .filter(line => line.includes(':'))
-            .map(line => `http://${line}`);  // convert to http://ip:port
+            .map(line => `http://${line}`);  // ensure http:// prefix
 
-        // Remove duplicates
         const unique = [...new Set(proxies)];
 
+        // Log the number loaded and a sample
         console.log(`[i] Loaded ${unique.length} HTTP proxies from ${PROXY_FILE}`);
         if (unique.length > 0) {
-            console.log(`   Example: ${unique[0]}`);
+            console.log(`   Example proxy: ${unique[0]}`);
         } else {
             console.log('[!] No valid proxies found in file.');
         }
-
         return unique;
     } catch (err) {
         console.error(`[!] Failed to read ${PROXY_FILE}: ${err.message}`);
@@ -56,14 +53,14 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== INITIAL PROXY POOL ==========
+// ========== INITIALISE POOL ==========
 function refreshProxyPool() {
     proxyPool = loadProxiesFromFile();
-    // Shuffle for randomness
+    // Shuffle
     proxyPool.sort(() => Math.random() - 0.5);
 }
 
-// ========== EXTRACT IP FROM PROXY STRING ==========
+// ========== EXTRACT IP ==========
 function extractIp(proxyStr) {
     if (!proxyStr) return 'direct';
     const parts = proxyStr.split('://');
@@ -73,10 +70,11 @@ function extractIp(proxyStr) {
 
 // ========== SINGLE VIEW REQUEST ==========
 async function sendView() {
+    // Pick a random proxy from pool
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = extractIp(proxy);
 
-    // Build proxy agent for axios
+    // Build proxy agent
     let proxyAgent = null;
     if (proxy) {
         const proxyUrl = new URL(proxy);
@@ -144,8 +142,6 @@ async function main() {
     }
 
     while (!stopFlag && successfulViews < TOTAL_VIEWS) {
-        requestCount++;
-
         const { success, ip, status } = await sendView();
         if (success) {
             successfulViews++;
