@@ -9,14 +9,15 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
 const ALLOWED_CHANNEL_ID = '1512808669522165832';
 const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 1000;
-const RETRIES = 3;
+const DELAY_BETWEEN_VIEWS = 1000; // 1 second
+const RETRIES = 2;   // reduced retries to speed up failures
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
-const PER_REQUEST_TIMEOUT = 10000; // 10 seconds hard limit per request
+const PER_REQUEST_TIMEOUT = 5000; // 5 seconds (more realistic for dead proxies)
+const PROXY_TEST_TIMEOUT = 3000;  // 3 seconds for startup proxy validation
 
 // ========== STATE ==========
-let proxyPool = [];
+let proxyPool = [];  // will contain only working proxies
 let dailyViews = {};
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const DATA_FILE = path.join(__dirname, 'dailyViews.json');
@@ -30,23 +31,49 @@ function saveDailyViews() {
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2)); } catch (e) {}
 }
 
-function loadProxiesFromFile() {
+// ========== PROXY VALIDATION ==========
+async function testProxy(proxyUrl) {
+    try {
+        const agent = new HttpsProxyAgent(proxyUrl);
+        const resp = await axios.get('https://guns.lol', {
+            httpsAgent: agent,
+            timeout: PROXY_TEST_TIMEOUT,
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+        });
+        return resp.status === 200;
+    } catch {
+        return false;
+    }
+}
+
+async function loadAndValidateProxies() {
     try {
         const content = fs.readFileSync(PROXY_FILE, 'utf8');
         const lines = content.split(/\r?\n/).filter(l => l.trim());
-        const proxies = lines.map(l => l.trim()).filter(l => l.includes(':')).map(l => `http://${l}`);
-        const unique = [...new Set(proxies)];
-        console.log(`[i] Loaded ${unique.length} proxies from ${PROXY_FILE}`);
-        return unique;
+        const raw = lines.map(l => l.trim()).filter(l => l.includes(':')).map(l => `http://${l}`);
+        const unique = [...new Set(raw)];
+        console.log(`[i] Found ${unique.length} proxies. Validating...`);
+
+        const valid = [];
+        for (const proxy of unique) {
+            const ok = await testProxy(proxy);
+            console.log(`   ${proxy} -> ${ok ? '✅' : '❌'}`);
+            if (ok) valid.push(proxy);
+        }
+        console.log(`[i] Working proxies: ${valid.length}`);
+        return valid;
     } catch (err) {
-        console.error(`[!] Failed to read ${PROXY_FILE}: ${err.message}`);
+        console.error(`[!] Proxy loading error: ${err.message}`);
         return [];
     }
 }
 
 // ========== VIEW REQUEST WITH HARD TIMEOUT ==========
-async function sendView(targetUrl, onLog) {
-    const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
+async function sendView(targetUrl, onLog, useProxy = true) {
+    let proxy = null;
+    if (useProxy && proxyPool.length > 0) {
+        proxy = proxyPool[Math.floor(Math.random() * proxyPool.length)];
+    }
     const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
 
     let proxyAgent = null;
@@ -64,21 +91,20 @@ async function sendView(targetUrl, onLog) {
         const config = {
             headers: {
                 'User-Agent': userAgent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://guns.lol/',
                 'DNT': '1',
                 'Connection': 'keep-alive',
             },
             httpsAgent: proxyAgent,
-            timeout: PER_REQUEST_TIMEOUT, // still set axios timeout as fallback
+            timeout: PER_REQUEST_TIMEOUT,
         };
 
         try {
-            // Wrap axios in a hard timeout via Promise.race
             const requestPromise = axios.get(targetUrl, config);
             const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Hard timeout')), PER_REQUEST_TIMEOUT + 2000) // give axios a bit extra
+                setTimeout(() => reject(new Error('Hard timeout')), PER_REQUEST_TIMEOUT + 1000)
             );
             const resp = await Promise.race([requestPromise, timeoutPromise]);
 
@@ -87,13 +113,15 @@ async function sendView(targetUrl, onLog) {
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
             };
             if (onLog) onLog(log);
-            if (resp.status === 200) return { success: true, ip, proxy, status: resp.status };
-            if (resp.status === 429) {
+            if (resp.status === 200) {
+                return { success: true, ip, proxy, status: resp.status };
+            } else if (resp.status === 429) {
                 const wait = Math.min((2 ** attempt + Math.random()) * 1000, 10000);
                 await sleep(wait);
                 continue;
+            } else {
+                return { success: false, ip, proxy, status: resp.status };
             }
-            return { success: false, ip, proxy, status: resp.status };
         } catch (err) {
             const log = {
                 proxy: proxy || 'none', ip, status: err.message === 'Hard timeout' ? 'timeout' : 'error', success: false,
@@ -116,11 +144,14 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`[✓] Logged in as ${client.user.tag}`);
     loadDailyViews();
-    proxyPool = loadProxiesFromFile();
-    if (proxyPool.length === 0) console.warn('[!] No proxies loaded.');
+    console.log('[i] Validating proxies...');
+    proxyPool = await loadAndValidateProxies();
+    if (proxyPool.length === 0) {
+        console.warn('[!] No working proxies found – will use direct connection.');
+    }
 });
 
 client.on('interactionCreate', async interaction => {
@@ -180,7 +211,7 @@ client.on('interactionCreate', async interaction => {
         const headerEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🚀 View Bot – Started')
-            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}`)
+            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies working:** ${proxyPool.length} (fallback to direct if none)`)
             .setThumbnail(THUMBNAIL_URL)
             .setTimestamp();
         await logChannel.send({ embeds: [headerEmbed] });
@@ -189,12 +220,15 @@ client.on('interactionCreate', async interaction => {
         let failed = 0;
         let logBatches = [];
 
+        // Decide whether to use proxy or direct for each request based on availability
+        const useProxy = proxyPool.length > 0;
+
         try {
             for (let i = 0; i < viewsToDo; i++) {
                 const result = await sendView(targetUrl, (logEntry) => {
                     const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
                     logBatches.push(line);
-                });
+                }, useProxy);
 
                 if (result.success) successful++;
                 else failed++;
@@ -231,7 +265,6 @@ client.on('interactionCreate', async interaction => {
             }
         } catch (err) {
             console.error('[FATAL] View loop error:', err);
-            // Even on fatal error, try to update embed
             const errorEmbed = EmbedBuilder.from(embed)
                 .setColor(0xFF0000)
                 .setTitle('❌ View Bot – Crashed')
@@ -307,7 +340,7 @@ client.on('interactionCreate', async interaction => {
             .setTitle('🌐 Proxy Pool Info')
             .setThumbnail(THUMBNAIL_URL)
             .addFields(
-                { name: 'Loaded Proxies', value: `${count}`, inline: true },
+                { name: 'Working Proxies', value: `${count}`, inline: true },
                 { name: 'Source File', value: PROXY_FILE, inline: true }
             )
             .setTimestamp();
@@ -323,7 +356,7 @@ client.on('interactionCreate', async interaction => {
             .addFields(
                 { name: '/views', value: 'Start view bot for a user.\n  `user` – username\n  `amount` – views (max 50/day)', inline: false },
                 { name: '/status', value: 'Check your remaining daily views.', inline: false },
-                { name: '/proxycount', value: 'Show number of loaded proxies.', inline: false },
+                { name: '/proxycount', value: 'Show number of working proxies.', inline: false },
                 { name: '/reset', value: '(Admin) Reset daily counts.', inline: false },
                 { name: '/help', value: 'Show this message.', inline: false }
             )
@@ -369,7 +402,7 @@ client.on('ready', async () => {
             .addStringOption(o => o.setName('user').setDescription('guns.lol username').setRequired(true))
             .addIntegerOption(o => o.setName('amount').setDescription('Views (max 50/day)').setRequired(true).setMinValue(1).setMaxValue(MAX_VIEWS_PER_USER_PER_DAY)),
         new SlashCommandBuilder().setName('status').setDescription('Check your remaining daily views'),
-        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of loaded proxies'),
+        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of working proxies'),
         new SlashCommandBuilder().setName('help').setDescription('Show available commands'),
         new SlashCommandBuilder()
             .setName('reset')
