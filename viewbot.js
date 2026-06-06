@@ -14,13 +14,14 @@ const MAX_VIEWS_PER_USER_PER_DAY = 50;
 const SPECIAL_USER_ID = '1350293413915918367'; // unlimited user
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
-const BROWSER_TIMEOUT = 30000;
-const NAVIGATION_TIMEOUT = 15000;
+const BROWSER_TIMEOUT = 25000; // slightly reduced
+const NAVIGATION_TIMEOUT = 12000;
 const PROXY_TEST_TIMEOUT = 5000;
 
 // ========== STATE ==========
 let proxyPool = [];
 let workingProxies = [];
+let goodProxies = []; // cache of proxies that worked recently
 let dailyViews = {};
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const DATA_FILE = path.join(__dirname, 'dailyViews.json');
@@ -90,12 +91,20 @@ async function filterWorkingProxies() {
         }
     }
     console.log(`[PROXY] After filtering: ${workingProxies.length} working proxies remaining`);
+    // Merge previously good proxies that are still in the pool
+    goodProxies = goodProxies.filter(p => workingProxies.includes(p));
+    console.log(`[PROXY] Good proxy cache: ${goodProxies.length} entries`);
 }
 
 // ========== REAL VIEW WITH PUPPETEER ==========
 async function sendRealView(targetUrl, onLog, forceDirect = false) {
-    const useProxy = !forceDirect && workingProxies.length > 0;
-    const proxy = useProxy ? workingProxies[Math.floor(Math.random() * workingProxies.length)] : null;
+    // First check cached good proxies
+    let proxy = null;
+    if (!forceDirect && goodProxies.length > 0) {
+        proxy = goodProxies[Math.floor(Math.random() * goodProxies.length)];
+    } else if (!forceDirect && workingProxies.length > 0) {
+        proxy = workingProxies[Math.floor(Math.random() * workingProxies.length)];
+    }
     const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
 
     console.log(`[VIEW] Starting view for ${targetUrl} ${proxy ? `via proxy ${ip}` : 'directly'}`);
@@ -139,9 +148,9 @@ async function sendRealView(targetUrl, onLog, forceDirect = false) {
         };
         if (onLog) onLog(log1);
 
-        // Wait 3 seconds AFTER page fully loaded
-        console.log(`[VIEW] Waiting 3 seconds before click (page fully loaded)...`);
-        await sleep(3000);
+        // Wait 2 seconds AFTER page fully loaded (reduced from 3)
+        console.log(`[VIEW] Waiting 2 seconds before click (page fully loaded)...`);
+        await sleep(2000);
 
         // Step 2: Click centre
         const viewport = page.viewport();
@@ -157,12 +166,17 @@ async function sendRealView(targetUrl, onLog, forceDirect = false) {
         };
         if (onLog) onLog(log2);
 
-        // Wait 2 seconds after click
-        console.log(`[VIEW] Waiting 2 seconds after click...`);
-        await sleep(2000);
+        // Wait 1 second after click (reduced from 2)
+        console.log(`[VIEW] Waiting 1 second after click...`);
+        await sleep(1000);
 
         await browser.close();
         console.log(`[VIEW] Browser closed, view completed successfully`);
+        // If proxy used and succeeded, add to goodProxies
+        if (proxy && !goodProxies.includes(proxy) && workingProxies.includes(proxy)) {
+            goodProxies.push(proxy);
+            console.log(`[VIEW] Added proxy ${ip} to good cache`);
+        }
         return { success: true, ip, proxy, status: 200 };
     } catch (err) {
         console.error(`[VIEW] Puppeteer error: ${err.message}`);
@@ -181,8 +195,9 @@ async function sendRealView(targetUrl, onLog, forceDirect = false) {
 
 // ========== FALLBACK: try proxy first, then direct ==========
 async function sendViewWithFallback(targetUrl, onLog) {
-    if (workingProxies.length > 0) {
-        console.log(`[FALLBACK] Attempting with working proxy...`);
+    // Try goodProxies first, then workingProxies, then direct
+    if (goodProxies.length > 0 || workingProxies.length > 0) {
+        console.log(`[FALLBACK] Attempting with proxy...`);
         const result = await sendRealView(targetUrl, onLog, false);
         if (result.success) {
             console.log(`[FALLBACK] Proxy attempt succeeded`);
@@ -280,7 +295,7 @@ client.on('interactionCreate', async interaction => {
             const headerEmbed = new EmbedBuilder()
                 .setColor(0x00FF00)
                 .setTitle('🚀 View Bot – Started')
-                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Working proxies:** ${workingProxies.length}/${proxyPool.length}\n**Special user:** ${isSpecial ? '✅' : '❌'}\n**Method:** Puppeteer (real browser, real click, filtered proxies)`)
+                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Working proxies:** ${workingProxies.length}/${proxyPool.length} (cached good: ${goodProxies.length})\n**Special user:** ${isSpecial ? '✅' : '❌'}\n**Method:** Puppeteer (real browser, real click, filtered proxies, cached good ones)`)
                 .setThumbnail(THUMBNAIL_URL)
                 .setTimestamp();
             await logChannel.send({ embeds: [headerEmbed] });
@@ -291,7 +306,7 @@ client.on('interactionCreate', async interaction => {
 
         let successful = 0;
         let failed = 0;
-        let logLines = [];  // will hold all log strings for the file
+        let logLines = [];
 
         try {
             for (let i = 0; i < viewsToDo; i++) {
@@ -309,7 +324,6 @@ client.on('interactionCreate', async interaction => {
                     console.warn(`[VIEWS] View #${i + 1} FAILED (IP: ${result.ip})`);
                 }
 
-                // Track daily views only for non-special users
                 if (!isSpecial) {
                     dailyViews[key] = (dailyViews[key] || 0) + 1;
                     saveDailyViews();
@@ -339,7 +353,7 @@ client.on('interactionCreate', async interaction => {
             try { await reply.edit({ content: `❌ Fatal error: ${e.message}` }); } catch (_) {}
         }
 
-        // Send the entire log as a text file
+        // Send log file
         if (logLines.length > 0) {
             try {
                 const fileContent = logLines.join('\n');
@@ -352,7 +366,6 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        // Summary log - show user usage only for non-special
         let todayUsed = isSpecial ? '♾️ Unlimited' : `${dailyViews[key]}/${MAX_VIEWS_PER_USER_PER_DAY}`;
         try {
             const summaryEmbed = new EmbedBuilder()
@@ -372,7 +385,6 @@ client.on('interactionCreate', async interaction => {
             console.error(`[VIEWS] Failed to send summary log: ${e.message}`);
         }
 
-        // Final public embed
         try {
             const finalEmbed = EmbedBuilder.from(embed)
                 .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
@@ -393,7 +405,27 @@ client.on('interactionCreate', async interaction => {
         console.log(`[VIEWS] Completed: ${successful} success, ${failed} failed`);
     }
 
-    // ========== Other commands ==========
+    // ========== /retest ==========
+    else if (commandName === 'retest') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        console.log(`[RETEST] ${requester.tag} requested proxy retest`);
+        const prev = workingProxies.length;
+        await filterWorkingProxies();
+        const embed = new EmbedBuilder()
+            .setColor(0x9B59B6)
+            .setTitle('🔄 Proxy Retest Complete')
+            .setThumbnail(THUMBNAIL_URL)
+            .addFields(
+                { name: 'Before', value: `${prev}`, inline: true },
+                { name: 'After', value: `${workingProxies.length}`, inline: true },
+                { name: 'Good Cache', value: `${goodProxies.length}`, inline: true },
+                { name: 'Total Loaded', value: `${proxyPool.length}`, inline: true }
+            )
+            .setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ========== /status ==========
     else if (commandName === 'status') {
         const today = TODAY();
         const key = `${requester.id}_${today}`;
@@ -415,13 +447,15 @@ client.on('interactionCreate', async interaction => {
     else if (commandName === 'proxycount') {
         const count = workingProxies.length;
         const total = proxyPool.length;
-        console.log(`[PROXYCOUNT] Working: ${count}/${total}`);
+        const cached = goodProxies.length;
+        console.log(`[PROXYCOUNT] Working: ${count}/${total}, Cached: ${cached}`);
         const embed = new EmbedBuilder()
             .setColor(0x9B59B6)
             .setTitle('🌐 Proxy Pool Info')
             .setThumbnail(THUMBNAIL_URL)
             .addFields(
                 { name: 'Working Proxies', value: `${count}`, inline: true },
+                { name: 'Cached Good', value: `${cached}`, inline: true },
                 { name: 'Total Loaded', value: `${total}`, inline: true },
                 { name: 'Source File', value: PROXY_FILE, inline: false }
             )
@@ -437,7 +471,8 @@ client.on('interactionCreate', async interaction => {
             .addFields(
                 { name: '/views', value: 'Start view bot for a user.\n  `user` – username\n  `amount` – views (max 50/day, unlimited for special user)', inline: false },
                 { name: '/status', value: 'Check your remaining daily views.', inline: false },
-                { name: '/proxycount', value: 'Show working/total proxies.', inline: false },
+                { name: '/proxycount', value: 'Show working/total/cached proxies.', inline: false },
+                { name: '/retest', value: 'Re-test all proxies (filters dead ones).', inline: false },
                 { name: '/reset', value: '(Admin) Reset daily counts.', inline: false },
                 { name: '/help', value: 'Show this message.', inline: false }
             )
@@ -484,7 +519,8 @@ client.on('ready', async () => {
             .addStringOption(o => o.setName('user').setDescription('guns.lol username').setRequired(true))
             .addIntegerOption(o => o.setName('amount').setDescription('Views (unlimited for special user, max 50 for others)').setRequired(true).setMinValue(1)),
         new SlashCommandBuilder().setName('status').setDescription('Check your remaining daily views'),
-        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of working proxies'),
+        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of working/cached proxies'),
+        new SlashCommandBuilder().setName('retest').setDescription('Re-test all proxies (admin)'),
         new SlashCommandBuilder().setName('help').setDescription('Show available commands'),
         new SlashCommandBuilder()
             .setName('reset')
