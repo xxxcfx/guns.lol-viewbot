@@ -1,6 +1,7 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
-const axios = require('axios');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const fs = require('fs');
 const path = require('path');
 
@@ -9,10 +10,9 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
 const ALLOWED_CHANNEL_ID = '1512808669522165832';
 const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 5000;  // 5 seconds (stay on site)
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
-const PER_REQUEST_TIMEOUT = 10000; // 10 seconds (enough for a 5-second stay)
+const BROWSER_TIMEOUT = 30000;
 
 // ========== STATE ==========
 let proxyPool = [];
@@ -21,9 +21,7 @@ const TODAY = () => new Date().toISOString().slice(0, 10);
 const DATA_FILE = path.join(__dirname, 'dailyViews.json');
 
 function loadDailyViews() {
-    try {
-        if (fs.existsSync(DATA_FILE)) dailyViews = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    } catch (e) {}
+    try { if (fs.existsSync(DATA_FILE)) dailyViews = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) {}
 }
 function saveDailyViews() {
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2)); } catch (e) {}
@@ -43,71 +41,88 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== VIEW REQUEST WITH PROXY + DIRECT FALLBACK ==========
-async function sendView(targetUrl, onLog) {
-    const attempts = [];
-    if (proxyPool.length > 0) {
-        const proxy = proxyPool[Math.floor(Math.random() * proxyPool.length)];
-        attempts.push({ proxy, type: 'proxy' });
-    }
-    attempts.push({ proxy: null, type: 'direct' });
+// ========== REAL CLICK USING PUPPETEER ==========
+async function sendRealView(targetUrl, onLog, forceDirect = false) {
+    const useProxy = !forceDirect && proxyPool.length > 0;
+    const proxy = useProxy ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
+    const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
 
-    for (const { proxy, type } of attempts) {
-        const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
-        let proxyAgent = null;
-        if (proxy) proxyAgent = new HttpsProxyAgent(proxy);
+    let browser = null;
+    try {
+        const args = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--window-size=1280,720',
+        ];
+        if (proxy) args.push(`--proxy-server=${proxy}`);
 
+        browser = await puppeteer.launch({
+            headless: true,
+            args,
+            timeout: BROWSER_TIMEOUT,
+        });
+
+        const page = await browser.newPage();
         const userAgent = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
         ][Math.floor(Math.random() * 3)];
+        await page.setUserAgent(userAgent);
+        await page.setViewport({ width: 1280, height: 720 });
 
-        const config = {
-            headers: {
-                'User-Agent': userAgent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Referer': 'https://guns.lol/',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-            },
-            httpsAgent: proxyAgent,
-            timeout: PER_REQUEST_TIMEOUT,
-            maxRedirects: 0,
-            validateStatus: () => true,
+        // Step 1: Load page
+        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        const log1 = {
+            proxy: proxy || 'none', ip, status: 'loaded', success: true,
+            timestamp: new Date().toISOString(), type: 'load',
         };
+        if (onLog) onLog(log1);
 
-        try {
-            const requestPromise = axios.get(targetUrl, config);
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Hard timeout')), PER_REQUEST_TIMEOUT + 1000)
-            );
-            const resp = await Promise.race([requestPromise, timeoutPromise]);
+        // Wait 3 seconds (reading)
+        await page.waitForTimeout(3000);
 
-            const log = {
-                proxy: proxy || 'none', ip, status: resp.status, success: true,
-                attempt: 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
-                type,
-            };
-            if (onLog) onLog(log);
-            return { success: true, ip, proxy, status: resp.status };
-        } catch (err) {
-            const log = {
-                proxy: proxy || 'none', ip, status: err.message === 'Hard timeout' ? 'timeout' : 'error', success: false,
-                attempt: 1, timestamp: new Date().toISOString(), userAgent: 'error',
-                type,
-            };
-            if (onLog) onLog(log);
-            console.error(`   [${type}] Failed: ${err.message}`);
-            if (type === 'direct') break;
-        }
+        // Step 2: Click centre of screen
+        const viewport = page.viewport();
+        await page.mouse.click(viewport.width / 2, viewport.height / 2);
+
+        const log2 = {
+            proxy: proxy || 'none', ip, status: 'clicked', success: true,
+            timestamp: new Date().toISOString(), type: 'click',
+        };
+        if (onLog) onLog(log2);
+
+        // Wait 2 seconds (lingering)
+        await page.waitForTimeout(2000);
+
+        await browser.close();
+        return { success: true, ip, proxy, status: 200 };
+    } catch (err) {
+        console.error(`   [Puppeteer] Error: ${err.message}`);
+        if (browser) await browser.close().catch(() => {});
+        const logErr = {
+            proxy: proxy || 'none', ip, status: 'error', success: false,
+            timestamp: new Date().toISOString(), type: 'error',
+        };
+        if (onLog) onLog(logErr);
+        return { success: false, ip, proxy, status: 'error' };
     }
-    return { success: false, ip: 'direct', proxy: null, status: 'error' };
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+// ========== FALLBACK: try proxy first, then direct ==========
+async function sendViewWithFallback(targetUrl, onLog) {
+    // Attempt with proxy if available
+    if (proxyPool.length > 0) {
+        const result = await sendRealView(targetUrl, onLog, false);
+        if (result.success) return result;
+        // If proxy failed, try direct
+        console.log('   [fallback] Proxy failed, trying direct...');
+    }
+    // Direct (no proxy)
+    const result = await sendRealView(targetUrl, onLog, true);
+    return result;
 }
 
 // ========== DISCORD BOT ==========
@@ -125,7 +140,6 @@ client.once('ready', () => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    // Channel restriction
     if (interaction.channelId !== ALLOWED_CHANNEL_ID) {
         return interaction.reply({
             content: `❌ Commands can only be used in <#${ALLOWED_CHANNEL_ID}>.`,
@@ -138,7 +152,7 @@ client.on('interactionCreate', async interaction => {
 
     // ========== /views ==========
     if (commandName === 'views') {
-        await interaction.deferReply(); // Public reply
+        await interaction.deferReply();
 
         const targetUser = interaction.options.getString('user');
         const amount = interaction.options.getInteger('amount');
@@ -157,7 +171,6 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply('❌ Log channel not found. Contact admin.');
         }
 
-        // Initial embed (public)
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🎯 guns.lol View Bot – Running')
@@ -170,33 +183,29 @@ client.on('interactionCreate', async interaction => {
                 { name: '❌ Failed', value: '0', inline: true },
                 { name: '⏱️ Status', value: '🎬 Starting...', inline: false },
             )
-            .setFooter({ text: `Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} views/user `})
+            .setFooter({ text: `Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} views/user` })
             .setTimestamp();
 
         const reply = await interaction.editReply({ embeds: [embed] });
 
-        // Header log (protected)
         try {
             const headerEmbed = new EmbedBuilder()
                 .setColor(0x00FF00)
                 .setTitle('🚀 View Bot – Started')
-                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}\n**Dwell time:** 5 seconds per view`)
+                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}\n**Method:** Puppeteer (real browser, real click)`)
                 .setThumbnail(THUMBNAIL_URL)
                 .setTimestamp();
             await logChannel.send({ embeds: [headerEmbed] });
-        } catch (e) {
-            console.error('[!] Header log send failed:', e.message);
-        }
+        } catch (e) {}
 
         let successful = 0;
         let failed = 0;
         let logBatches = [];
 
-        // Safe loop
         try {
             for (let i = 0; i < viewsToDo; i++) {
-                const result = await sendView(targetUrl, (logEntry) => {
-                    const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt} | **Type:** ${logEntry.type}`;
+                const result = await sendViewWithFallback(targetUrl, (logEntry) => {
+                    const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Type:** ${logEntry.type} | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'}`;
                     logBatches.push(line);
                 });
 
@@ -207,8 +216,8 @@ client.on('interactionCreate', async interaction => {
                 saveDailyViews();
 
                 const statusText = result.success
-                    ? `✅ View #${i + 1} added (status: ${result.status})`
-                    : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+                    ? `✅ View #${i + 1} complete (clicked centre)`
+                    : `❌ View #${i + 1} failed`;
 
                 try {
                     const updatedEmbed = EmbedBuilder.from(embed)
@@ -221,11 +230,8 @@ client.on('interactionCreate', async interaction => {
                             { name: '⏱️ Status', value: statusText, inline: false },
                         );
                     await reply.edit({ embeds: [updatedEmbed] });
-                } catch (e) {
-                    console.error('[!] Embed update failed:', e.message);
-                }
+                } catch (e) {}
 
-                // Send batch logs safely
                 if (logBatches.length >= 10) {
                     try {
                         const batch = logBatches.join('\n');
@@ -234,23 +240,15 @@ client.on('interactionCreate', async interaction => {
                             .setDescription(batch.slice(0, 4000))
                             .setTimestamp();
                         await logChannel.send({ embeds: [logEmbed] });
-                    } catch (e) {
-                        console.error('[!] Batch log send failed:', e.message);
-                    }
+                    } catch (e) {}
                     logBatches = [];
                 }
-
-                // 🕐 WAIT 5 SECONDS BEFORE NEXT VIEW (simulate staying on site)
-                if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
             }
         } catch (e) {
             console.error('[FATAL] Loop error:', e);
-            try {
-                await reply.edit({ content: `❌ Fatal error: ${e.message}` });
-            } catch (_) {}
+            try { await reply.edit({ content: `❌ Fatal error: ${e.message}` }); } catch (_) {}
         }
 
-        // Send remaining logs
         if (logBatches.length > 0) {
             try {
                 const batch = logBatches.join('\n');
@@ -259,12 +257,9 @@ client.on('interactionCreate', async interaction => {
                     .setDescription(batch.slice(0, 4000))
                     .setTimestamp();
                 await logChannel.send({ embeds: [logEmbed] });
-            } catch (e) {
-                console.error('[!] Final log send failed:', e.message);
-            }
+            } catch (e) {}
         }
 
-        // Final summary log
         try {
             const summaryEmbed = new EmbedBuilder()
                 .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
@@ -278,11 +273,8 @@ client.on('interactionCreate', async interaction => {
                 )
                 .setTimestamp();
             await logChannel.send({ embeds: [summaryEmbed] });
-        } catch (e) {
-            console.error('[!] Summary log send failed:', e.message);
-        }
+        } catch (e) {}
 
-        // Final embed (public)
         try {
             const finalEmbed = EmbedBuilder.from(embed)
                 .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
@@ -296,12 +288,10 @@ client.on('interactionCreate', async interaction => {
                     { name: '⏱️ Status', value: '✅ Finished!', inline: false },
                 );
             await reply.edit({ embeds: [finalEmbed] });
-        } catch (e) {
-            console.error('[!] Final embed edit failed:', e.message);
-        }
+        } catch (e) {}
     }
 
-    // ========== Other commands ==========
+    // ========== Other commands (unchanged) ==========
     else if (commandName === 'status') {
         const today = TODAY();
         const key = `${requester.id}_${today}`;
@@ -319,7 +309,6 @@ client.on('interactionCreate', async interaction => {
             .setTimestamp();
         await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
-
     else if (commandName === 'proxycount') {
         const count = proxyPool.length;
         const embed = new EmbedBuilder()
@@ -333,7 +322,6 @@ client.on('interactionCreate', async interaction => {
             .setTimestamp();
         await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
-
     else if (commandName === 'help') {
         const embed = new EmbedBuilder()
             .setColor(0x2ECC71)
@@ -349,7 +337,6 @@ client.on('interactionCreate', async interaction => {
             .setTimestamp();
         await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
-
     else if (commandName === 'reset') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return interaction.reply({ content: '❌ Admin only.', flags: MessageFlags.Ephemeral });
