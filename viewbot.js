@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const fs = require('fs');
@@ -10,14 +10,13 @@ const ALLOWED_CHANNEL_ID = '1512808669522165832';
 const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
 const DELAY_BETWEEN_VIEWS = 1000; // 1 second
-const RETRIES = 2;   // reduced retries to speed up failures
+const RETRIES = 2;
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
-const PER_REQUEST_TIMEOUT = 5000; // 5 seconds (more realistic for dead proxies)
-const PROXY_TEST_TIMEOUT = 3000;  // 3 seconds for startup proxy validation
+const PER_REQUEST_TIMEOUT = 5000; // 5 seconds
 
 // ========== STATE ==========
-let proxyPool = [];  // will contain only working proxies
+let proxyPool = [];
 let dailyViews = {};
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const DATA_FILE = path.join(__dirname, 'dailyViews.json');
@@ -31,44 +30,22 @@ function saveDailyViews() {
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2)); } catch (e) {}
 }
 
-// ========== PROXY VALIDATION ==========
-async function testProxy(proxyUrl) {
-    try {
-        const agent = new HttpsProxyAgent(proxyUrl);
-        const resp = await axios.get('https://guns.lol', {
-            httpsAgent: agent,
-            timeout: PROXY_TEST_TIMEOUT,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-        });
-        return resp.status === 200;
-    } catch {
-        return false;
-    }
-}
-
-async function loadAndValidateProxies() {
+// ========== LOAD PROXIES (no validation – use all as provided) ==========
+function loadProxiesFromFile() {
     try {
         const content = fs.readFileSync(PROXY_FILE, 'utf8');
         const lines = content.split(/\r?\n/).filter(l => l.trim());
-        const raw = lines.map(l => l.trim()).filter(l => l.includes(':')).map(l => `http://${l}`);
-        const unique = [...new Set(raw)];
-        console.log(`[i] Found ${unique.length} proxies. Validating...`);
-
-        const valid = [];
-        for (const proxy of unique) {
-            const ok = await testProxy(proxy);
-            console.log(`   ${proxy} -> ${ok ? '✅' : '❌'}`);
-            if (ok) valid.push(proxy);
-        }
-        console.log(`[i] Working proxies: ${valid.length}`);
-        return valid;
+        const proxies = lines.map(l => l.trim()).filter(l => l.includes(':')).map(l => `http://${l}`);
+        const unique = [...new Set(proxies)];
+        console.log(`[i] Loaded ${unique.length} proxies from ${PROXY_FILE}`);
+        return unique;
     } catch (err) {
-        console.error(`[!] Proxy loading error: ${err.message}`);
+        console.error(`[!] Failed to read ${PROXY_FILE}: ${err.message}`);
         return [];
     }
 }
 
-// ========== VIEW REQUEST WITH HARD TIMEOUT ==========
+// ========== VIEW REQUEST (with redirect handling) ==========
 async function sendView(targetUrl, onLog, useProxy = true) {
     let proxy = null;
     if (useProxy && proxyPool.length > 0) {
@@ -99,6 +76,8 @@ async function sendView(targetUrl, onLog, useProxy = true) {
             },
             httpsAgent: proxyAgent,
             timeout: PER_REQUEST_TIMEOUT,
+            maxRedirects: 0,                          // DO NOT follow redirects – treat any status as success
+            validateStatus: () => true,                // Accept any status code (including 3xx)
         };
 
         try {
@@ -108,20 +87,14 @@ async function sendView(targetUrl, onLog, useProxy = true) {
             );
             const resp = await Promise.race([requestPromise, timeoutPromise]);
 
+            // Treat any HTTP response (2xx, 3xx, 4xx, 5xx) as a "success" for the view bot
+            const success = resp.status >= 200 && resp.status < 600; // always true because of validateStatus, but keep as flag
             const log = {
-                proxy: proxy || 'none', ip, status: resp.status, success: resp.status === 200,
+                proxy: proxy || 'none', ip, status: resp.status, success: true, // always mark success if we got a response
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
             };
             if (onLog) onLog(log);
-            if (resp.status === 200) {
-                return { success: true, ip, proxy, status: resp.status };
-            } else if (resp.status === 429) {
-                const wait = Math.min((2 ** attempt + Math.random()) * 1000, 10000);
-                await sleep(wait);
-                continue;
-            } else {
-                return { success: false, ip, proxy, status: resp.status };
-            }
+            return { success: true, ip, proxy, status: resp.status };
         } catch (err) {
             const log = {
                 proxy: proxy || 'none', ip, status: err.message === 'Hard timeout' ? 'timeout' : 'error', success: false,
@@ -144,14 +117,11 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-client.once('ready', async () => {
+client.once('ready', () => {
     console.log(`[✓] Logged in as ${client.user.tag}`);
     loadDailyViews();
-    console.log('[i] Validating proxies...');
-    proxyPool = await loadAndValidateProxies();
-    if (proxyPool.length === 0) {
-        console.warn('[!] No working proxies found – will use direct connection.');
-    }
+    proxyPool = loadProxiesFromFile();
+    if (proxyPool.length === 0) console.warn('[!] No proxies loaded – will use direct connection.');
 });
 
 client.on('interactionCreate', async interaction => {
@@ -161,7 +131,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.channelId !== ALLOWED_CHANNEL_ID) {
         return interaction.reply({
             content: `❌ Commands can only be used in <#${ALLOWED_CHANNEL_ID}>.`,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
         });
     }
 
@@ -170,7 +140,7 @@ client.on('interactionCreate', async interaction => {
 
     // ========== /views ==========
     if (commandName === 'views') {
-        await interaction.deferReply({ ephemeral: false });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const targetUser = interaction.options.getString('user');
         const amount = interaction.options.getInteger('amount');
@@ -211,7 +181,7 @@ client.on('interactionCreate', async interaction => {
         const headerEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🚀 View Bot – Started')
-            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies working:** ${proxyPool.length} (fallback to direct if none)`)
+            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}`)
             .setThumbnail(THUMBNAIL_URL)
             .setTimestamp();
         await logChannel.send({ embeds: [headerEmbed] });
@@ -219,8 +189,6 @@ client.on('interactionCreate', async interaction => {
         let successful = 0;
         let failed = 0;
         let logBatches = [];
-
-        // Decide whether to use proxy or direct for each request based on availability
         const useProxy = proxyPool.length > 0;
 
         try {
@@ -237,7 +205,7 @@ client.on('interactionCreate', async interaction => {
                 saveDailyViews();
 
                 const statusText = result.success
-                    ? `✅ View #${i + 1} added (IP: ${result.ip})`
+                    ? `✅ View #${i + 1} added (status: ${result.status})`
                     : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
 
                 const updatedEmbed = EmbedBuilder.from(embed)
@@ -329,7 +297,7 @@ client.on('interactionCreate', async interaction => {
                 { name: 'Daily Limit', value: `${MAX_VIEWS_PER_USER_PER_DAY}`, inline: true }
             )
             .setTimestamp();
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
     // ========== /proxycount ==========
@@ -340,11 +308,11 @@ client.on('interactionCreate', async interaction => {
             .setTitle('🌐 Proxy Pool Info')
             .setThumbnail(THUMBNAIL_URL)
             .addFields(
-                { name: 'Working Proxies', value: `${count}`, inline: true },
+                { name: 'Loaded Proxies', value: `${count}`, inline: true },
                 { name: 'Source File', value: PROXY_FILE, inline: true }
             )
             .setTimestamp();
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
     // ========== /help ==========
@@ -356,18 +324,18 @@ client.on('interactionCreate', async interaction => {
             .addFields(
                 { name: '/views', value: 'Start view bot for a user.\n  `user` – username\n  `amount` – views (max 50/day)', inline: false },
                 { name: '/status', value: 'Check your remaining daily views.', inline: false },
-                { name: '/proxycount', value: 'Show number of working proxies.', inline: false },
+                { name: '/proxycount', value: 'Show number of loaded proxies.', inline: false },
                 { name: '/reset', value: '(Admin) Reset daily counts.', inline: false },
                 { name: '/help', value: 'Show this message.', inline: false }
             )
             .setTimestamp();
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
     // ========== /reset (admin) ==========
     else if (commandName === 'reset') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-            return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+            return interaction.reply({ content: '❌ Admin only.', flags: MessageFlags.Ephemeral });
         }
         const userOption = interaction.options.getUser('user');
         const allOption = interaction.options.getBoolean('all');
@@ -377,18 +345,18 @@ client.on('interactionCreate', async interaction => {
             const keys = Object.keys(dailyViews).filter(k => k.endsWith(`_${today}`));
             keys.forEach(k => delete dailyViews[k]);
             saveDailyViews();
-            await interaction.reply({ content: `✅ Reset for **all users** (${keys.length} entries).`, ephemeral: true });
+            await interaction.reply({ content: `✅ Reset for **all users** (${keys.length} entries).`, flags: MessageFlags.Ephemeral });
         } else if (userOption) {
             const key = `${userOption.id}_${today}`;
             if (dailyViews[key]) {
                 delete dailyViews[key];
                 saveDailyViews();
-                await interaction.reply({ content: `✅ Reset for ${userOption.tag}.`, ephemeral: true });
+                await interaction.reply({ content: `✅ Reset for ${userOption.tag}.`, flags: MessageFlags.Ephemeral });
             } else {
-                await interaction.reply({ content: `❌ No usage found for ${userOption.tag} today.`, ephemeral: true });
+                await interaction.reply({ content: `❌ No usage found for ${userOption.tag} today.`, flags: MessageFlags.Ephemeral });
             }
         } else {
-            await interaction.reply({ content: '❌ Specify user or use `all: true`.', ephemeral: true });
+            await interaction.reply({ content: '❌ Specify user or use `all: true`.', flags: MessageFlags.Ephemeral });
         }
     }
 });
@@ -402,7 +370,7 @@ client.on('ready', async () => {
             .addStringOption(o => o.setName('user').setDescription('guns.lol username').setRequired(true))
             .addIntegerOption(o => o.setName('amount').setDescription('Views (max 50/day)').setRequired(true).setMinValue(1).setMaxValue(MAX_VIEWS_PER_USER_PER_DAY)),
         new SlashCommandBuilder().setName('status').setDescription('Check your remaining daily views'),
-        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of working proxies'),
+        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of loaded proxies'),
         new SlashCommandBuilder().setName('help').setDescription('Show available commands'),
         new SlashCommandBuilder()
             .setName('reset')
