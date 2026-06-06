@@ -7,43 +7,39 @@ const path = require('path');
 
 // ========== CONFIG ==========
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
-const LOG_CHANNEL_ID = '1512806516145520670';
+const ALLOWED_CHANNEL_ID = '1512808669522165832'; // Only this channel can use commands
+const LOG_CHANNEL_ID = '1512806516145520670';     // Detailed logs go here
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 1000; // 1 second
+const DELAY_BETWEEN_VIEWS = 1000;
 const RETRIES = 3;
 const PROXY_FILE = 'http.txt';
+const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
 
 // ========== STATE ==========
 let proxyPool = [];
-let dailyViews = {};  // { "userId_date": count }
+let dailyViews = {};
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const DATA_FILE = path.join(__dirname, 'dailyViews.json');
 
-// ========== PERSISTENCE ==========
 function loadDailyViews() {
     try {
-        if (fs.existsSync(DATA_FILE)) {
+        if (fs.existsSync(DATA_FILE))
             dailyViews = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-        }
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
 }
 function saveDailyViews() {
     try {
         fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2));
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
 }
 
-// ========== PROXY LOADING ==========
 function loadProxiesFromFile() {
     try {
         const content = fs.readFileSync(PROXY_FILE, 'utf8');
-        const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
-        const proxies = lines
-            .map(line => line.trim())
-            .filter(line => line.includes(':'))
-            .map(line => `http://${line}`);
+        const lines = content.split(/\r?\n/).filter(l => l.trim());
+        const proxies = lines.map(l => l.trim()).filter(l => l.includes(':')).map(l => `http://${l}`);
         const unique = [...new Set(proxies)];
-        console.log(`[i] Loaded ${unique.length} HTTP proxies from ${PROXY_FILE}`);
+        console.log(`[i] Loaded ${unique.length} proxies from ${PROXY_FILE}`);
         return unique;
     } catch (err) {
         console.error(`[!] Failed to read ${PROXY_FILE}: ${err.message}`);
@@ -51,22 +47,15 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== SINGLE VIEW REQUEST ==========
 async function sendView(targetUrl, onLog) {
-    const proxy = proxyPool.length > 0
-        ? proxyPool[Math.floor(Math.random() * proxyPool.length)]
-        : null;
-
+    const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
 
     let proxyAgent = null;
     if (proxy) {
-        const proxyUrl = new URL(proxy);
-        if (proxyUrl.protocol === 'http:') {
-            proxyAgent = new HttpProxyAgent(proxy);
-        } else if (proxyUrl.protocol === 'https:') {
-            proxyAgent = new HttpsProxyAgent(proxy);
-        }
+        const url = new URL(proxy);
+        if (url.protocol === 'http:') proxyAgent = new HttpProxyAgent(proxy);
+        else if (url.protocol === 'https:') proxyAgent = new HttpsProxyAgent(proxy);
     }
 
     const userAgent = [
@@ -83,7 +72,6 @@ async function sendView(targetUrl, onLog) {
             'Referer': 'https://guns.lol/',
             'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         },
         httpAgent: proxyAgent,
         httpsAgent: proxyAgent,
@@ -93,40 +81,39 @@ async function sendView(targetUrl, onLog) {
     for (let attempt = 0; attempt < RETRIES; attempt++) {
         try {
             const resp = await axios.get(targetUrl, config);
-            const logEntry = {
+            const status = resp.status;
+            const success = status === 200;
+            const log = {
                 proxy: proxy || 'none',
                 ip,
-                status: resp.status,
-                success: resp.status === 200,
+                status,
+                success,
                 attempt: attempt + 1,
                 timestamp: new Date().toISOString(),
-                userAgent: userAgent.slice(0, 50)
+                userAgent: userAgent.slice(0, 50),
             };
-            if (onLog) onLog(logEntry);
-            if (resp.status === 200) {
-                return { success: true, ip, proxy };
-            } else if (resp.status === 429) {
-                const wait = Math.min(Math.pow(2, attempt) + Math.random(), 10) * 1000;
-                console.log(`   ⏳ 429 – waiting ${wait/1000}s`);
+            if (onLog) onLog(log);
+            if (success) return { success: true, ip, proxy, status };
+            if (status === 429) {
+                const wait = Math.min((2 ** attempt + Math.random()) * 1000, 10000);
                 await sleep(wait);
                 continue;
-            } else {
-                return { success: false, ip, proxy, status: resp.status };
             }
+            return { success: false, ip, proxy, status };
         } catch (err) {
             await sleep(1000);
         }
     }
-    const logEntry = {
+    const log = {
         proxy: proxy || 'none',
         ip,
         status: 'error',
         success: false,
         attempt: RETRIES,
         timestamp: new Date().toISOString(),
-        userAgent: 'error'
+        userAgent: 'error',
     };
-    if (onLog) onLog(logEntry);
+    if (onLog) onLog(log);
     return { success: false, ip, proxy, status: 'error' };
 }
 
@@ -136,21 +123,26 @@ function sleep(ms) {
 
 // ========== DISCORD BOT ==========
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 client.once('ready', () => {
-    console.log(`[✓] Bot logged in as ${client.user.tag}`);
+    console.log(`[✓] Logged in as ${client.user.tag}`);
     loadDailyViews();
     proxyPool = loadProxiesFromFile();
-    if (proxyPool.length === 0) {
-        console.warn('[!] No proxies loaded. Views may fail.');
-    }
+    if (proxyPool.length === 0) console.warn('[!] No proxies loaded.');
 });
 
-// ========== COMMAND HANDLER ==========
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
+
+    // ---- CHANNEL RESTRICTION ----
+    if (interaction.channelId !== ALLOWED_CHANNEL_ID) {
+        return interaction.reply({
+            content: `❌ Commands can only be used in the designated channel (<#${ALLOWED_CHANNEL_ID}>).`,
+            ephemeral: true,
+        });
+    }
 
     const commandName = interaction.commandName;
     const requester = interaction.user;
@@ -163,84 +155,128 @@ client.on('interactionCreate', async interaction => {
         const amount = interaction.options.getInteger('amount');
         const today = TODAY();
         const key = `${requester.id}_${today}`;
-
         const usedToday = dailyViews[key] || 0;
         const allowed = MAX_VIEWS_PER_USER_PER_DAY - usedToday;
+
         if (allowed <= 0) {
-            await interaction.editReply(`❌ You have reached your daily limit of ${MAX_VIEWS_PER_USER_PER_DAY} views. Try again tomorrow.`);
-            return;
+            return interaction.editReply(`❌ You've used all ${MAX_VIEWS_PER_USER_PER_DAY} daily views. Try again tomorrow.`);
         }
         const viewsToDo = Math.min(amount, allowed);
-
         const targetUrl = `https://guns.lol/${targetUser}`;
         const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
         if (!logChannel) {
-            await interaction.editReply('❌ Log channel not found. Contact admin.');
-            return;
+            return interaction.editReply('❌ Log channel not found. Contact admin.');
         }
 
-        await interaction.editReply(`🎯 Starting views for **${targetUser}** – ${viewsToDo} views (1s delay). Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} (used: ${usedToday}). Logging to <#${LOG_CHANNEL_ID}>.`);
+        // Neat embed (initial)
+        const progress = (done, total) => `${done}/${total}`;
+        const embed = new EmbedBuilder()
+            .setColor(0x00FF00)
+            .setTitle('🎯 guns.lol View Bot – Running')
+            .setThumbnail(THUMBNAIL_URL)
+            .addFields(
+                { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
+                { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
+                { name: '📊 Progress', value: progress(0, viewsToDo), inline: false },
+                { name: '✅ Successful', value: '0', inline: true },
+                { name: '❌ Failed', value: '0', inline: true },
+                { name: '⏱️ Status', value: 'Starting...', inline: false },
+            )
+            .setFooter({ text: `Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} views/user` })
+            .setTimestamp();
 
-        // Header log
+        const reply = await interaction.editReply({ embeds: [embed] });
+
+        // Send header to log channel
         const headerEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setTitle(`🚀 View Bot – ${targetUser}`)
-            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Date:** ${today}\n**Proxy Pool:** ${proxyPool.length}`)
+            .setTitle('🚀 View Bot – Started')
+            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}`)
+            .setThumbnail(THUMBNAIL_URL)
             .setTimestamp();
         await logChannel.send({ embeds: [headerEmbed] });
 
         let successful = 0;
         let failed = 0;
-        let logMessages = [];
+        let logBatches = [];
 
         for (let i = 0; i < viewsToDo; i++) {
-            const { success, ip, proxy, status } = await sendView(targetUrl, (logEntry) => {
-                const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** ${logEntry.proxy} | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
-                logMessages.push(line);
+            const result = await sendView(targetUrl, (logEntry) => {
+                const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
+                logBatches.push(line);
             });
 
-            if (success) successful++;
+            if (result.success) successful++;
             else failed++;
 
+            // Update daily count
             dailyViews[key] = (dailyViews[key] || 0) + 1;
             saveDailyViews();
 
-            if (logMessages.length >= 10) {
-                const batch = logMessages.join('\n');
-                const embed = new EmbedBuilder()
+            // Update embed
+            const statusText = result.success ? `✅ View #${i + 1} added (IP: ${result.ip})` : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+            const updatedEmbed = EmbedBuilder.from(embed)
+                .setFields(
+                    { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
+                    { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
+                    { name: '📊 Progress', value: progress(i + 1, viewsToDo), inline: false },
+                    { name: '✅ Successful', value: `${successful}`, inline: true },
+                    { name: '❌ Failed', value: `${failed}`, inline: true },
+                    { name: '⏱️ Status', value: statusText, inline: false },
+                );
+            await reply.edit({ embeds: [updatedEmbed] });
+
+            // Send log batches every 10 entries
+            if (logBatches.length >= 10) {
+                const batch = logBatches.join('\n');
+                const logEmbed = new EmbedBuilder()
                     .setColor(0x3498DB)
                     .setDescription(batch.slice(0, 4000))
                     .setTimestamp();
-                await logChannel.send({ embeds: [embed] });
-                logMessages = [];
+                await logChannel.send({ embeds: [logEmbed] });
+                logBatches = [];
             }
 
-            await sleep(DELAY_BETWEEN_VIEWS);
+            if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
         }
 
-        // Remaining logs
-        if (logMessages.length > 0) {
-            const batch = logMessages.join('\n');
-            const embed = new EmbedBuilder()
+        // Send remaining logs
+        if (logBatches.length > 0) {
+            const batch = logBatches.join('\n');
+            const logEmbed = new EmbedBuilder()
                 .setColor(0x3498DB)
                 .setDescription(batch.slice(0, 4000))
                 .setTimestamp();
-            await logChannel.send({ embeds: [embed] });
+            await logChannel.send({ embeds: [logEmbed] });
         }
 
-        // Final summary
+        // Final summary in log channel
         const summaryEmbed = new EmbedBuilder()
             .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
-            .setTitle('🏁 View Bot Finished')
+            .setTitle('🏁 View Bot – Finished')
+            .setThumbnail(THUMBNAIL_URL)
             .addFields(
                 { name: '✅ Successful', value: `${successful}`, inline: true },
                 { name: '❌ Failed', value: `${failed}`, inline: true },
-                { name: 'Total Today (User)', value: `${dailyViews[key]} / ${MAX_VIEWS_PER_USER_PER_DAY}`, inline: true }
+                { name: 'User Today', value: `${dailyViews[key]}/${MAX_VIEWS_PER_USER_PER_DAY}`, inline: true },
+                { name: 'Requested by', value: requester.tag, inline: false },
             )
             .setTimestamp();
         await logChannel.send({ embeds: [summaryEmbed] });
 
-        await interaction.followUp(`✅ **View bot finished!** Successful: ${successful}, Failed: ${failed}. Check <#${LOG_CHANNEL_ID}> for full logs.`);
+        // Final update to the interactive embed
+        const finalEmbed = EmbedBuilder.from(embed)
+            .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
+            .setTitle('🏁 View Bot – Completed')
+            .setFields(
+                { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
+                { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
+                { name: '📊 Progress', value: progress(successful, viewsToDo), inline: false },
+                { name: '✅ Successful', value: `${successful}`, inline: true },
+                { name: '❌ Failed', value: `${failed}`, inline: true },
+                { name: '⏱️ Status', value: '✅ Finished!', inline: false },
+            );
+        await reply.edit({ embeds: [finalEmbed] });
     }
 
     // ========== /status ==========
@@ -249,10 +285,10 @@ client.on('interactionCreate', async interaction => {
         const key = `${requester.id}_${today}`;
         const used = dailyViews[key] || 0;
         const remaining = MAX_VIEWS_PER_USER_PER_DAY - used;
-
         const embed = new EmbedBuilder()
             .setColor(0x3498DB)
             .setTitle('📊 Your Daily View Usage')
+            .setThumbnail(THUMBNAIL_URL)
             .addFields(
                 { name: 'Used Today', value: `${used}`, inline: true },
                 { name: 'Remaining', value: `${remaining}`, inline: true },
@@ -268,6 +304,7 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
             .setColor(0x9B59B6)
             .setTitle('🌐 Proxy Pool Info')
+            .setThumbnail(THUMBNAIL_URL)
             .addFields(
                 { name: 'Loaded Proxies', value: `${count}`, inline: true },
                 { name: 'Source File', value: PROXY_FILE, inline: true }
@@ -281,46 +318,43 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
             .setColor(0x2ECC71)
             .setTitle('📚 Available Commands')
+            .setThumbnail(THUMBNAIL_URL)
             .addFields(
                 { name: '/views', value: 'Start view bot for a user.\n  `user` – guns.lol username\n  `amount` – views (max 50/day)', inline: false },
                 { name: '/status', value: 'Show your remaining daily views.', inline: false },
                 { name: '/proxycount', value: 'Show number of loaded proxies.', inline: false },
-                { name: '/reset', value: '(Admin only) Reset daily counts for a user or all.', inline: false },
+                { name: '/reset', value: '(Admin only) Reset daily counts.', inline: false },
                 { name: '/help', value: 'Show this message.', inline: false }
             )
             .setTimestamp();
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    // ========== /reset (admin only) ==========
+    // ========== /reset (admin) ==========
     else if (commandName === 'reset') {
-        // Only allow members with ADMINISTRATOR permission
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-            await interaction.reply({ content: '❌ You need Administrator permission to use this command.', ephemeral: true });
-            return;
+            return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
         }
-
         const userOption = interaction.options.getUser('user');
         const allOption = interaction.options.getBoolean('all');
         const today = TODAY();
 
         if (allOption) {
-            // Reset all users for today
-            const keysToDelete = Object.keys(dailyViews).filter(k => k.endsWith(`_${today}`));
-            keysToDelete.forEach(k => delete dailyViews[k]);
+            const keys = Object.keys(dailyViews).filter(k => k.endsWith(`_${today}`));
+            keys.forEach(k => delete dailyViews[k]);
             saveDailyViews();
-            await interaction.reply({ content: `✅ Reset daily counts for **all users** (${keysToDelete.length} entries) for today.`, ephemeral: true });
+            await interaction.reply({ content: `✅ Reset for **all users** (${keys.length} entries).`, ephemeral: true });
         } else if (userOption) {
-            const resetKey = `${userOption.id}_${today}`;
-            if (dailyViews[resetKey]) {
-                delete dailyViews[resetKey];
+            const key = `${userOption.id}_${today}`;
+            if (dailyViews[key]) {
+                delete dailyViews[key];
                 saveDailyViews();
-                await interaction.reply({ content: `✅ Reset daily count for ${userOption.tag}.`, ephemeral: true });
+                await interaction.reply({ content: `✅ Reset for ${userOption.tag}.`, ephemeral: true });
             } else {
-                await interaction.reply({ content: `❌ No daily count found for ${userOption.tag} today.`, ephemeral: true });
+                await interaction.reply({ content: `❌ No usage found for ${userOption.tag} today.`, ephemeral: true });
             }
         } else {
-            await interaction.reply({ content: '❌ Please specify a user or use `all: true`.', ephemeral: true });
+            await interaction.reply({ content: '❌ Specify user or use `all: true`.', ephemeral: true });
         }
     }
 });
@@ -331,39 +365,20 @@ client.on('ready', async () => {
         new SlashCommandBuilder()
             .setName('views')
             .setDescription('Add views to a guns.lol profile')
-            .addStringOption(option =>
-                option.setName('user')
-                    .setDescription('guns.lol username (e.g., f7tv)')
-                    .setRequired(true))
-            .addIntegerOption(option =>
-                option.setName('amount')
-                    .setDescription('Number of views (max ' + MAX_VIEWS_PER_USER_PER_DAY + ' per day)')
-                    .setRequired(true)
-                    .setMinValue(1)
-                    .setMaxValue(MAX_VIEWS_PER_USER_PER_DAY)),
-        new SlashCommandBuilder()
-            .setName('status')
-            .setDescription('Check your remaining daily views'),
-        new SlashCommandBuilder()
-            .setName('proxycount')
-            .setDescription('Show number of loaded proxies'),
-        new SlashCommandBuilder()
-            .setName('help')
-            .setDescription('Show available commands'),
+            .addStringOption(o => o.setName('user').setDescription('guns.lol username').setRequired(true))
+            .addIntegerOption(o => o.setName('amount').setDescription('Views (max 50/day)').setRequired(true).setMinValue(1).setMaxValue(MAX_VIEWS_PER_USER_PER_DAY)),
+        new SlashCommandBuilder().setName('status').setDescription('Check your remaining daily views'),
+        new SlashCommandBuilder().setName('proxycount').setDescription('Show number of loaded proxies'),
+        new SlashCommandBuilder().setName('help').setDescription('Show available commands'),
         new SlashCommandBuilder()
             .setName('reset')
             .setDescription('(Admin) Reset daily view counts')
-            .addUserOption(option =>
-                option.setName('user')
-                    .setDescription('User to reset (leave blank with --all)'))
-            .addBooleanOption(option =>
-                option.setName('all')
-                    .setDescription('Set to true to reset all users for today'))
+            .addUserOption(o => o.setName('user').setDescription('User to reset'))
+            .addBooleanOption(o => o.setName('all').setDescription('Reset all users today')),
     ];
-
     try {
         await client.application.commands.set(commands);
-        console.log('[✓] Slash commands registered.');
+        console.log('[✓] Commands registered.');
     } catch (err) {
         console.error('[!] Failed to register commands:', err);
     }
