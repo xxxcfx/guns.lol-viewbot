@@ -1,7 +1,6 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const axios = require('axios');
-const { HttpProxyAgent } = require('http-proxy-agent');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const { HttpsProxyAgent } = require('https-proxy-agent'); // single agent works for both HTTP and HTTPS targets
 const fs = require('fs');
 const path = require('path');
 
@@ -10,7 +9,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
 const ALLOWED_CHANNEL_ID = '1512808669522165832';
 const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 1000; // 1 second
+const DELAY_BETWEEN_VIEWS = 1000;
 const RETRIES = 3;
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
@@ -24,7 +23,7 @@ const DATA_FILE = path.join(__dirname, 'dailyViews.json');
 function loadDailyViews() {
     try {
         if (fs.existsSync(DATA_FILE)) dailyViews = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
 }
 function saveDailyViews() {
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2)); } catch (e) {}
@@ -44,16 +43,16 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== VIEW REQUEST WITH TIMEOUT ==========
+// ========== VIEW REQUEST (fixed proxy agent) ==========
 async function sendView(targetUrl, onLog) {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
 
+    // Always use HttpsProxyAgent because target is HTTPS
     let proxyAgent = null;
     if (proxy) {
-        const url = new URL(proxy);
-        if (url.protocol === 'http:') proxyAgent = new HttpProxyAgent(proxy);
-        else if (url.protocol === 'https:') proxyAgent = new HttpsProxyAgent(proxy);
+        // For HTTPS targets, HttpsProxyAgent works with both HTTP and HTTPS proxies.
+        proxyAgent = new HttpsProxyAgent(proxy);
     }
 
     const userAgent = [
@@ -71,39 +70,34 @@ async function sendView(targetUrl, onLog) {
             'DNT': '1',
             'Connection': 'keep-alive',
         },
-        httpAgent: proxyAgent,
-        httpsAgent: proxyAgent,
-        timeout: 15000, // 15s per request
+        httpsAgent: proxyAgent,  // use HttpsProxyAgent
+        httpAgent: undefined,    // not needed
+        timeout: 15000,
     };
 
     for (let attempt = 0; attempt < RETRIES; attempt++) {
         try {
             const resp = await axios.get(targetUrl, config);
-            const status = resp.status;
-            const success = status === 200;
             const log = {
-                proxy: proxy || 'none', ip, status, success,
+                proxy: proxy || 'none', ip, status: resp.status, success: resp.status === 200,
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
             };
             if (onLog) onLog(log);
-            if (success) return { success: true, ip, proxy, status };
-            if (status === 429) {
+            if (resp.status === 200) return { success: true, ip, proxy, status: resp.status };
+            if (resp.status === 429) {
                 const wait = Math.min((2 ** attempt + Math.random()) * 1000, 10000);
                 await sleep(wait);
                 continue;
             }
-            return { success: false, ip, proxy, status };
+            return { success: false, ip, proxy, status: resp.status };
         } catch (err) {
-            // If error, log failure and retry
             const log = {
                 proxy: proxy || 'none', ip, status: 'error', success: false,
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: 'error',
             };
             if (onLog) onLog(log);
-            if (attempt < RETRIES - 1) {
-                const wait = 2000; // 2s between retries
-                await sleep(wait);
-            }
+            console.error(`   [ERROR] Attempt ${attempt + 1}: ${err.message}`);
+            if (attempt < RETRIES - 1) await sleep(2000);
         }
     }
     return { success: false, ip, proxy, status: 'error' };
@@ -203,7 +197,6 @@ client.on('interactionCreate', async interaction => {
             dailyViews[key] = (dailyViews[key] || 0) + 1;
             saveDailyViews();
 
-            // Update embed after each attempt
             const statusText = result.success
                 ? `✅ View #${i + 1} added (IP: ${result.ip})`
                 : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
@@ -219,7 +212,6 @@ client.on('interactionCreate', async interaction => {
                 );
             await reply.edit({ embeds: [updatedEmbed] });
 
-            // Batch logs every 10 entries
             if (logBatches.length >= 10) {
                 const batch = logBatches.join('\n');
                 const logEmbed = new EmbedBuilder()
@@ -233,7 +225,7 @@ client.on('interactionCreate', async interaction => {
             if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
         }
 
-        // Send remaining logs
+        // Remaining logs
         if (logBatches.length > 0) {
             const batch = logBatches.join('\n');
             const logEmbed = new EmbedBuilder()
@@ -243,7 +235,7 @@ client.on('interactionCreate', async interaction => {
             await logChannel.send({ embeds: [logEmbed] });
         }
 
-        // Final log summary
+        // Final summary log
         const summaryEmbed = new EmbedBuilder()
             .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
             .setTitle('🏁 View Bot – Finished')
@@ -257,7 +249,7 @@ client.on('interactionCreate', async interaction => {
             .setTimestamp();
         await logChannel.send({ embeds: [summaryEmbed] });
 
-        // Final embed update
+        // Final embed
         const finalEmbed = EmbedBuilder.from(embed)
             .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
             .setTitle('🏁 View Bot – Completed')
@@ -272,7 +264,7 @@ client.on('interactionCreate', async interaction => {
         await reply.edit({ embeds: [finalEmbed] });
     }
 
-    // ========== Other commands (status, proxycount, help, reset) ==========
+    // ========== /status ==========
     else if (commandName === 'status') {
         const today = TODAY();
         const key = `${requester.id}_${today}`;
@@ -291,6 +283,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
+    // ========== /proxycount ==========
     else if (commandName === 'proxycount') {
         const count = proxyPool.length;
         const embed = new EmbedBuilder()
@@ -305,6 +298,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
+    // ========== /help ==========
     else if (commandName === 'help') {
         const embed = new EmbedBuilder()
             .setColor(0x2ECC71)
@@ -321,6 +315,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
+    // ========== /reset (admin) ==========
     else if (commandName === 'reset') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
