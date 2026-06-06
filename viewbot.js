@@ -8,7 +8,7 @@ const TARGET_USERNAME = 'f7tv';
 const TARGET_URL = `https://guns.lol/${TARGET_USERNAME}`;
 
 const TOTAL_VIEWS = parseInt(process.env.TOTAL_VIEWS || '200');
-const DELAY_MS = parseInt(process.env.DELAY_MS || '5000'); // 5 seconds
+const DELAY_MS = parseInt(process.env.DELAY_MS || '1000'); // 1 second between requests
 const RETRIES = parseInt(process.env.RETRIES || '3');
 
 const PROXY_FILE = 'http.txt';  // One proxy per line: ip:port
@@ -39,7 +39,6 @@ function loadProxiesFromFile() {
 
         const unique = [...new Set(proxies)];
 
-        // Log the number loaded and a sample
         console.log(`[i] Loaded ${unique.length} HTTP proxies from ${PROXY_FILE}`);
         if (unique.length > 0) {
             console.log(`   Example proxy: ${unique[0]}`);
@@ -56,7 +55,6 @@ function loadProxiesFromFile() {
 // ========== INITIALISE POOL ==========
 function refreshProxyPool() {
     proxyPool = loadProxiesFromFile();
-    // Shuffle
     proxyPool.sort(() => Math.random() - 0.5);
 }
 
@@ -70,11 +68,9 @@ function extractIp(proxyStr) {
 
 // ========== SINGLE VIEW REQUEST ==========
 async function sendView() {
-    // Pick a random proxy from pool
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = extractIp(proxy);
 
-    // Build proxy agent
     let proxyAgent = null;
     if (proxy) {
         const proxyUrl = new URL(proxy);
@@ -128,7 +124,7 @@ function sleep(ms) {
 // ========== MAIN LOOP ==========
 async function main() {
     console.log('='.repeat(60));
-    console.log('🎯 guns.lol View Bot (Local http.txt proxies)');
+    console.log('🎯 guns.lol View Bot (Local http.txt proxies, 1s delay)');
     console.log(`   Target: ${TARGET_URL}`);
     console.log(`   Goal: ${TOTAL_VIEWS} views`);
     console.log(`   Delay: ${DELAY_MS/1000}s`);
