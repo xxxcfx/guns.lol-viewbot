@@ -7,10 +7,10 @@ const path = require('path');
 
 // ========== CONFIG ==========
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
-const ALLOWED_CHANNEL_ID = '1512808669522165832'; // Only this channel can use commands
-const LOG_CHANNEL_ID = '1512806516145520670';     // Detailed logs go here
+const ALLOWED_CHANNEL_ID = '1512808669522165832';
+const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 1000;
+const DELAY_BETWEEN_VIEWS = 1000; // 1 second
 const RETRIES = 3;
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
@@ -23,14 +23,11 @@ const DATA_FILE = path.join(__dirname, 'dailyViews.json');
 
 function loadDailyViews() {
     try {
-        if (fs.existsSync(DATA_FILE))
-            dailyViews = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    } catch (e) {}
+        if (fs.existsSync(DATA_FILE)) dailyViews = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    } catch (e) { /* ignore */ }
 }
 function saveDailyViews() {
-    try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2));
-    } catch (e) {}
+    try { fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2)); } catch (e) {}
 }
 
 function loadProxiesFromFile() {
@@ -47,6 +44,7 @@ function loadProxiesFromFile() {
     }
 }
 
+// ========== VIEW REQUEST WITH TIMEOUT ==========
 async function sendView(targetUrl, onLog) {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = proxy ? proxy.split('://')[1].split(':')[0] : 'direct';
@@ -75,7 +73,7 @@ async function sendView(targetUrl, onLog) {
         },
         httpAgent: proxyAgent,
         httpsAgent: proxyAgent,
-        timeout: 15000,
+        timeout: 15000, // 15s per request
     };
 
     for (let attempt = 0; attempt < RETRIES; attempt++) {
@@ -84,13 +82,8 @@ async function sendView(targetUrl, onLog) {
             const status = resp.status;
             const success = status === 200;
             const log = {
-                proxy: proxy || 'none',
-                ip,
-                status,
-                success,
-                attempt: attempt + 1,
-                timestamp: new Date().toISOString(),
-                userAgent: userAgent.slice(0, 50),
+                proxy: proxy || 'none', ip, status, success,
+                attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
             };
             if (onLog) onLog(log);
             if (success) return { success: true, ip, proxy, status };
@@ -101,19 +94,18 @@ async function sendView(targetUrl, onLog) {
             }
             return { success: false, ip, proxy, status };
         } catch (err) {
-            await sleep(1000);
+            // If error, log failure and retry
+            const log = {
+                proxy: proxy || 'none', ip, status: 'error', success: false,
+                attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: 'error',
+            };
+            if (onLog) onLog(log);
+            if (attempt < RETRIES - 1) {
+                const wait = 2000; // 2s between retries
+                await sleep(wait);
+            }
         }
     }
-    const log = {
-        proxy: proxy || 'none',
-        ip,
-        status: 'error',
-        success: false,
-        attempt: RETRIES,
-        timestamp: new Date().toISOString(),
-        userAgent: 'error',
-    };
-    if (onLog) onLog(log);
     return { success: false, ip, proxy, status: 'error' };
 }
 
@@ -136,10 +128,10 @@ client.once('ready', () => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    // ---- CHANNEL RESTRICTION ----
+    // Channel restriction
     if (interaction.channelId !== ALLOWED_CHANNEL_ID) {
         return interaction.reply({
-            content: `❌ Commands can only be used in the designated channel (<#${ALLOWED_CHANNEL_ID}>).`,
+            content: `❌ Commands can only be used in <#${ALLOWED_CHANNEL_ID}>.`,
             ephemeral: true,
         });
     }
@@ -168,8 +160,7 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply('❌ Log channel not found. Contact admin.');
         }
 
-        // Neat embed (initial)
-        const progress = (done, total) => `${done}/${total}`;
+        // Initial embed
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🎯 guns.lol View Bot – Running')
@@ -177,17 +168,17 @@ client.on('interactionCreate', async interaction => {
             .addFields(
                 { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
                 { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
-                { name: '📊 Progress', value: progress(0, viewsToDo), inline: false },
+                { name: '📊 Progress', value: `0/${viewsToDo}`, inline: false },
                 { name: '✅ Successful', value: '0', inline: true },
                 { name: '❌ Failed', value: '0', inline: true },
-                { name: '⏱️ Status', value: 'Starting...', inline: false },
+                { name: '⏱️ Status', value: '🎬 Starting...', inline: false },
             )
             .setFooter({ text: `Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} views/user` })
             .setTimestamp();
 
         const reply = await interaction.editReply({ embeds: [embed] });
 
-        // Send header to log channel
+        // Header log
         const headerEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🚀 View Bot – Started')
@@ -209,24 +200,26 @@ client.on('interactionCreate', async interaction => {
             if (result.success) successful++;
             else failed++;
 
-            // Update daily count
             dailyViews[key] = (dailyViews[key] || 0) + 1;
             saveDailyViews();
 
-            // Update embed
-            const statusText = result.success ? `✅ View #${i + 1} added (IP: ${result.ip})` : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+            // Update embed after each attempt
+            const statusText = result.success
+                ? `✅ View #${i + 1} added (IP: ${result.ip})`
+                : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+
             const updatedEmbed = EmbedBuilder.from(embed)
                 .setFields(
                     { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
                     { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
-                    { name: '📊 Progress', value: progress(i + 1, viewsToDo), inline: false },
+                    { name: '📊 Progress', value: `${i + 1}/${viewsToDo}`, inline: false },
                     { name: '✅ Successful', value: `${successful}`, inline: true },
                     { name: '❌ Failed', value: `${failed}`, inline: true },
                     { name: '⏱️ Status', value: statusText, inline: false },
                 );
             await reply.edit({ embeds: [updatedEmbed] });
 
-            // Send log batches every 10 entries
+            // Batch logs every 10 entries
             if (logBatches.length >= 10) {
                 const batch = logBatches.join('\n');
                 const logEmbed = new EmbedBuilder()
@@ -250,7 +243,7 @@ client.on('interactionCreate', async interaction => {
             await logChannel.send({ embeds: [logEmbed] });
         }
 
-        // Final summary in log channel
+        // Final log summary
         const summaryEmbed = new EmbedBuilder()
             .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
             .setTitle('🏁 View Bot – Finished')
@@ -264,14 +257,14 @@ client.on('interactionCreate', async interaction => {
             .setTimestamp();
         await logChannel.send({ embeds: [summaryEmbed] });
 
-        // Final update to the interactive embed
+        // Final embed update
         const finalEmbed = EmbedBuilder.from(embed)
             .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
             .setTitle('🏁 View Bot – Completed')
             .setFields(
                 { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
                 { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
-                { name: '📊 Progress', value: progress(successful, viewsToDo), inline: false },
+                { name: '📊 Progress', value: `${successful}/${viewsToDo}`, inline: false },
                 { name: '✅ Successful', value: `${successful}`, inline: true },
                 { name: '❌ Failed', value: `${failed}`, inline: true },
                 { name: '⏱️ Status', value: '✅ Finished!', inline: false },
@@ -279,7 +272,7 @@ client.on('interactionCreate', async interaction => {
         await reply.edit({ embeds: [finalEmbed] });
     }
 
-    // ========== /status ==========
+    // ========== Other commands (status, proxycount, help, reset) ==========
     else if (commandName === 'status') {
         const today = TODAY();
         const key = `${requester.id}_${today}`;
@@ -298,7 +291,6 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    // ========== /proxycount ==========
     else if (commandName === 'proxycount') {
         const count = proxyPool.length;
         const embed = new EmbedBuilder()
@@ -313,24 +305,22 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    // ========== /help ==========
     else if (commandName === 'help') {
         const embed = new EmbedBuilder()
             .setColor(0x2ECC71)
             .setTitle('📚 Available Commands')
             .setThumbnail(THUMBNAIL_URL)
             .addFields(
-                { name: '/views', value: 'Start view bot for a user.\n  `user` – guns.lol username\n  `amount` – views (max 50/day)', inline: false },
-                { name: '/status', value: 'Show your remaining daily views.', inline: false },
+                { name: '/views', value: 'Start view bot for a user.\n  `user` – username\n  `amount` – views (max 50/day)', inline: false },
+                { name: '/status', value: 'Check your remaining daily views.', inline: false },
                 { name: '/proxycount', value: 'Show number of loaded proxies.', inline: false },
-                { name: '/reset', value: '(Admin only) Reset daily counts.', inline: false },
+                { name: '/reset', value: '(Admin) Reset daily counts.', inline: false },
                 { name: '/help', value: 'Show this message.', inline: false }
             )
             .setTimestamp();
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    // ========== /reset (admin) ==========
     else if (commandName === 'reset') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
@@ -359,7 +349,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ========== REGISTER SLASH COMMANDS ==========
+// ========== REGISTER COMMANDS ==========
 client.on('ready', async () => {
     const commands = [
         new SlashCommandBuilder()
