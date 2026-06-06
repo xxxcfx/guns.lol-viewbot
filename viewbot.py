@@ -2,18 +2,21 @@ import os
 import random
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import requests
 
 # ========== CONFIGURATION ==========
 TARGET_USERNAME = "f7tv"
 TARGET_URL = f"https://guns.lol/{TARGET_USERNAME}"
-TOTAL_VIEWS = int(os.getenv("TOTAL_VIEWS", "200"))       # How many views to add
-WORKERS = int(os.getenv("WORKERS", "1"))                  # Keep 1 for sequential requests
-DELAY = float(os.getenv("DELAY", "5"))                    # Seconds between requests
-RETRIES = int(os.getenv("RETRIES", "3"))                  # Retry on error/429
-PROXY_API = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
-PROXY_REFRESH_INTERVAL = int(os.getenv("PROXY_REFRESH_INTERVAL", "50"))  # Refresh proxies every N requests
+TOTAL_VIEWS = int(os.getenv("TOTAL_VIEWS", "500"))
+WORKERS = int(os.getenv("WORKERS", "1"))
+DELAY = float(os.getenv("DELAY", "5"))
+RETRIES = int(os.getenv("RETRIES", "3"))
+
+# Proxifly settings
+PROXIFLY_API_KEY = os.getenv("PROXIFLY_API_KEY", "3wjHnRJ6pgxMDrwvpkykFSv3jRGNnSqh4VTbJ8kfSBZp")
+PROXIFLY_API_URL = "https://api.proxifly.dev/v1/proxies"
+PROXY_REFRESH_INTERVAL = int(os.getenv("PROXY_REFRESH_INTERVAL", "50"))
 
 # ========== GLOBALS ==========
 proxy_pool = []
@@ -30,44 +33,51 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
 ]
 
-# ========== PROXY LOADING ==========
+# ========== PROXY LOADING (Proxifly) ==========
 def fetch_proxies():
-    """Fetch proxy list from the API and return as list."""
+    """Fetch proxy list from Proxifly API."""
     try:
-        resp = requests.get(PROXY_API, timeout=15)
+        params = {
+            "api_key": PROXIFLY_API_KEY,
+            "limit": 100,          # Max proxies per request
+            "protocol": "http",    # or "socks5" if needed
+        }
+        resp = requests.get(PROXIFLY_API_URL, params=params, timeout=15)
         if resp.status_code == 200:
-            proxies = [line.strip() for line in resp.text.splitlines() if line.strip()]
-            proxies = list(set(proxies))  # remove duplicates
+            data = resp.json()
+            # Proxifly returns an array of objects: [{"ip":"...","port":...,"protocol":"http"}, ...]
+            proxies = []
+            for p in data:
+                if "ip" in p and "port" in p:
+                    protocol = p.get("protocol", "http")
+                    proxy_str = f"{protocol}://{p['ip']}:{p['port']}"
+                    proxies.append(proxy_str)
             return proxies
         else:
-            print(f"[!] Proxy API returned status {resp.status_code}")
+            print(f"[!] Proxifly API returned status {resp.status_code}: {resp.text[:100]}")
             return []
     except Exception as e:
-        print(f"[!] Failed to fetch proxies: {e}")
+        print(f"[!] Failed to fetch proxies from Proxifly: {e}")
         return []
 
 def refresh_proxy_pool():
-    """Refresh global proxy_pool with fresh proxies."""
     global proxy_pool
     new_proxies = fetch_proxies()
     if new_proxies:
         proxy_pool = new_proxies
-        print(f"[i] Proxy pool refreshed: {len(proxy_pool)} proxies loaded")
+        print(f"[i] Proxifly pool refreshed: {len(proxy_pool)} proxies loaded")
     else:
-        print("[!] Proxy fetch returned empty list. Keeping current pool.")
+        print("[!] Proxifly returned empty list. Keeping current pool.")
     random.shuffle(proxy_pool)
 
-# ========== HELPER: Extract IP from proxy string ==========
+# ========== HELPER ==========
 def extract_ip(proxy_str):
-    """Extract IP from 'protocol://ip:port' or return 'direct'."""
     if not proxy_str:
         return "direct"
-    # Remove protocol prefix
     if "://" in proxy_str:
         ip_port = proxy_str.split("://")[1]
     else:
         ip_port = proxy_str
-    # Remove port
     if ":" in ip_port:
         ip = ip_port.split(":")[0]
     else:
@@ -76,10 +86,7 @@ def extract_ip(proxy_str):
 
 # ========== SINGLE VIEW REQUEST ==========
 def send_view():
-    """Send one view request using a random proxy.
-    Returns (success: bool, proxy_ip: str)"""
-    global proxy_pool, request_counter
-
+    global proxy_pool
     proxy = None
     proxy_ip = "direct"
     if proxy_pool:
@@ -87,7 +94,6 @@ def send_view():
         proxy_ip = extract_ip(proxy)
     
     proxies = {"http": proxy, "https": proxy} if proxy else None
-
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -114,7 +120,7 @@ def send_view():
             continue
     return (False, proxy_ip)
 
-# ========== WORKER LOOP ==========
+# ========== WORKER ==========
 def worker_thread(worker_id):
     global successful_views, failed_views, request_counter
     while not stop_flag.is_set():
@@ -122,7 +128,6 @@ def worker_thread(worker_id):
             if successful_views >= TOTAL_VIEWS:
                 stop_flag.set()
                 return
-        # Refresh proxy pool periodically
         with lock:
             request_counter += 1
             if request_counter % PROXY_REFRESH_INTERVAL == 0:
@@ -145,27 +150,25 @@ def worker_thread(worker_id):
 def main():
     global successful_views, failed_views
     print("=" * 60)
-    print(f"🎯 guns.lol View Bot (Live IP logging)")
+    print("🎯 guns.lol View Bot (Proxifly Residential Proxies)")
     print(f"   Target: {TARGET_URL}")
     print(f"   Goal: {TOTAL_VIEWS} views")
     print(f"   Delay: {DELAY}s between requests")
-    print(f"   Proxy refresh every {PROXY_REFRESH_INTERVAL} requests")
-    print(f"   Proxy API: {PROXY_API}")
+    print(f"   Proxifly API Key: {PROXIFLY_API_KEY[:8]}...")
     print("=" * 60)
-    
-    print("[i] Fetching initial proxy pool...")
-    refresh_proxy_pool()
 
+    print("[i] Fetching initial proxy pool from Proxifly...")
+    refresh_proxy_pool()
     if not proxy_pool:
-        print("[!] Warning: No proxies found. Continuing without proxies.")
-    
+        print("[!] Warning: No proxies loaded. Continuing without proxies.")
+
     with ThreadPoolExecutor(max_workers=WORKERS) as executor:
         futures = [executor.submit(worker_thread, i) for i in range(WORKERS)]
         stop_flag.wait()
         executor.shutdown(wait=False)
-    
+
     print("\n" + "=" * 60)
-    print(f"🏁 Finished!")
+    print("🏁 Finished!")
     print(f"   Successful views added: {successful_views}")
     print(f"   Failed attempts: {failed_views}")
     print("=" * 60)
