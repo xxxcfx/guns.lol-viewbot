@@ -3,7 +3,7 @@ const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { HttpProxyAgent } = require('http-proxy-agent');
 
-// ========== CONFIGURATION ==========
+// ========== CONFIG ==========
 const TARGET_USERNAME = 'f7tv';
 const TARGET_URL = `https://guns.lol/${TARGET_USERNAME}`;
 
@@ -28,104 +28,56 @@ const USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
 ];
 
-// ========== DEBUG FUNCTION – RUN ONCE ==========
-async function debugProxiflyShape() {
-    try {
-        const proxifly = new Proxifly({ apiKey: PROXIFLY_API_KEY });
-        const result = await proxifly.getProxy({
-            countries: ['US', 'RU'],
-            protocol: ['http'],
-            quantity: 5,
-            https: true
-        });
-        console.log('=== DEBUG: Proxifly getProxy response ===');
-        console.log('typeof result:', typeof result);
-        console.log('isArray:', Array.isArray(result));
-        console.dir(result, { depth: 10 });
-        return result;
-    } catch (err) {
-        console.error('=== DEBUG ERROR ===');
-        console.error('err:', err);
-        console.error('err.message:', err?.message);
-        console.error('err.response?.data:', err?.response?.data);
-        return null;
-    }
-}
-
-// ========== PROXY FETCHING – ROBUST ==========
+// ========== PROXY FETCHING (using official Proxifly API) ==========
 async function fetchProxies() {
     try {
         const proxifly = new Proxifly({ apiKey: PROXIFLY_API_KEY });
         const result = await proxifly.getProxy({
-            countries: ['US', 'RU'],
-            protocol: ['http'],
-            quantity: 20,
-            https: true
+            protocol: 'http',            // Only HTTP (axios-compatible)
+            https: true,
+            quantity: 20,                // 20 proxies per batch
+            format: 'json'               // Default, but explicit
         });
 
-        // --- RESPONSE SHAPE HANDLING ---
-        // Based on real Proxifly npm response: it can be an array of objects
-        // { ip, port, protocol, country, ... } or sometimes { proxies: [...] }.
-        // We'll handle both.
-
-        if (!result) return [];
-
-        let proxyList = [];
+        // --- Handle response shape ---
+        let proxies = [];
 
         if (Array.isArray(result)) {
-            // Direct array
-            result.forEach(p => {
-                if (p.ip && p.port) {
-                    proxyList.push(`${p.protocol || 'http'}://${p.ip}:${p.port}`);
-                }
-            });
-        } else if (result.proxies && Array.isArray(result.proxies)) {
-            // Object with proxies array
-            result.proxies.forEach(p => {
-                if (p.ip && p.port) {
-                    proxyList.push(`${p.protocol || 'http'}://${p.ip}:${p.port}`);
-                }
-            });
-        } else if (result.data && Array.isArray(result.data)) {
-            // Sometimes nested under data
-            result.data.forEach(p => {
-                if (p.ip && p.port) {
-                    proxyList.push(`${p.protocol || 'http'}://${p.ip}:${p.port}`);
-                }
-            });
-        } else if (typeof result === 'object') {
-            // Fallback: try to extract any array property
-            const possibleArrays = Object.values(result).filter(v => Array.isArray(v));
-            if (possibleArrays.length > 0) {
-                proxyList = possibleArrays[0].map(p => {
-                    if (p.ip && p.port) {
-                        return `${p.protocol || 'http'}://${p.ip}:${p.port}`;
-                    }
-                    return null;
-                }).filter(Boolean);
-            }
+            // Multiple proxies: array of proxy objects
+            proxies = result.map(p => p.proxy); // e.g. "http://ip:port"
+        } else if (result && result.proxy) {
+            // Single proxy: object with .proxy string
+            proxies = [result.proxy];
+        } else if (result && Array.isArray(result.proxies)) {
+            // Fallback: some versions return { proxies: [...] }
+            proxies = result.proxies.map(p => p.proxy || `${p.protocol}://${p.ip}:${p.port}`);
+        } else {
+            console.log('[!] Unexpected response shape from Proxifly');
+            console.dir(result, { depth: 3 });
+            return [];
         }
+
+        // Filter out non-HTTP proxies (just in case)
+        proxies = proxies.filter(p => p.startsWith('http://') || p.startsWith('https://'));
 
         // Remove duplicates
-        proxyList = [...new Set(proxyList)];
+        proxies = [...new Set(proxies)];
 
-        if (proxyList.length > 0) {
-            console.log(`[i] Fetched ${proxyList.length} proxies from Proxifly`);
-            console.log(`   Example: ${proxyList[0]}`);
+        if (proxies.length > 0) {
+            console.log(`[i] Fetched ${proxies.length} HTTP proxies from Proxifly`);
+            console.log(`   Example: ${proxies[0]}`);
         } else {
-            console.log('[!] Proxifly returned no usable proxies (missing ip/port).');
-            // Optional: run debug once
-            console.log('   Run debugProxiflyShape() to see raw response.');
+            console.log('[!] No usable HTTP proxies returned.');
         }
 
-        return proxyList;
+        return proxies;
     } catch (err) {
         console.error('[!] Proxifly fetch error:', err?.message);
         if (err?.response?.data) {
             console.error('   Response data:', err.response.data);
         }
         if (err?.message?.includes('out of daily requests')) {
-            console.error('[✗] Proxifly quota exhausted. Upgrade your plan.');
+            console.error('[✗] Proxifly daily quota exhausted.');
             process.exit(1);
         }
         return [];
@@ -140,11 +92,11 @@ async function refreshProxyPool() {
     } else {
         console.log('[!] No proxies returned – keeping current pool.');
     }
-    // Shuffle
+    // Shuffle for randomness
     proxyPool.sort(() => Math.random() - 0.5);
 }
 
-// ========== EXTRACT IP ==========
+// ========== EXTRACT IP FROM PROXY STRING ==========
 function extractIp(proxyStr) {
     if (!proxyStr) return 'direct';
     const parts = proxyStr.split('://');
@@ -157,7 +109,7 @@ async function sendView() {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = extractIp(proxy);
 
-    // Build proxy agent
+    // Build proxy agent for axios
     let proxyAgent = null;
     if (proxy) {
         const proxyUrl = new URL(proxy);
@@ -197,7 +149,6 @@ async function sendView() {
                 return { success: false, ip, status: resp.status };
             }
         } catch (err) {
-            // Network error / timeout
             await sleep(1000);
         }
     }
@@ -212,15 +163,12 @@ function sleep(ms) {
 // ========== MAIN LOOP ==========
 async function main() {
     console.log('='.repeat(60));
-    console.log('🎯 guns.lol View Bot (Node.js + Proxifly – Final)');
+    console.log('🎯 guns.lol View Bot (Node.js + Proxifly v3.0.1)');
     console.log(`   Target: ${TARGET_URL}`);
     console.log(`   Goal: ${TOTAL_VIEWS} views`);
     console.log(`   Delay: ${DELAY_MS/1000}s`);
     console.log(`   Proxifly API Key: ${PROXIFLY_API_KEY.slice(0, 8)}...`);
     console.log('='.repeat(60));
-
-    // Optional: run debug once to log response shape (comment out after first run)
-    // await debugProxiflyShape();
 
     console.log('[i] Fetching initial proxy pool...');
     await refreshProxyPool();
