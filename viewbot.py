@@ -1,4 +1,3 @@
-const Proxifly = require('proxifly');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { HttpProxyAgent } = require('http-proxy-agent');
@@ -12,7 +11,11 @@ const DELAY_MS = parseInt(process.env.DELAY_MS || '5000'); // 5 seconds
 const RETRIES = parseInt(process.env.RETRIES || '3');
 const PROXY_REFRESH_INTERVAL = parseInt(process.env.PROXY_REFRESH_INTERVAL || '20');
 
-const PROXIFLY_API_KEY = process.env.PROXIFLY_API_KEY || '3wjHnRJ6pgxMDrwvpkykFSv3jRGNnSqh4VTbJ8kfSBZp';
+// ProxyScrape API (free, returns HTTP proxies in JSON)
+const PROXY_API_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get' +
+  '?request=display_proxies&proxy_format=ipport&format=json' +
+  '&protocol=http' +
+  '&country=af%2Cal%2Cdz%2Cad%2Cao%2Car%2Cam%2Cau%2Cat%2Caz%2Cbd%2Cby%2Cbe%2Cbj%2Cbm%2Cbt%2Cbo%2Cbw%2Cbg%2Cbf%2Cbi%2Ckh%2Ccm%2Cca%2Ctd%2Ccl%2Ccn%2Cco%2Ccg%2Ccr%2Chr%2Ccy%2Ccz%2Cdk%2Cdo%2Cec%2Ceg%2Csv%2Cgq%2Cee%2Csz%2Cet%2Cfj%2Cfi%2Cfr%2Cgm%2Cge%2Cde%2Cgh%2Cgi%2Cgr%2Cgu%2Cgt%2Cgn%2Cht%2Chn%2Chk%2Chu%2Cin%2Cid%2Cir%2Ciq%2Cie%2Cil%2Cit%2Cjm%2Cjp%2Cjo%2Ckz%2Cke%2Ckr%2Ckg%2Clv%2Clb%2Cls%2Clt%2Cmg%2Cmw%2Cmy%2Cmv%2Cml%2Cmt%2Cmu%2Cmx%2Cmd%2Cmn%2Cme%2Cma%2Cmz%2Cmm%2Cna%2Cnp%2Cnl%2Cnz%2Cni%2Cng%2Cmk%2Cno%2Cpk%2Cps%2Cpa%2Cpy%2Cpe%2Cph%2Cpl%2Cpt%2Cpr%2Cqa%2Cro%2Crw%2Ckn%2Csa%2Csn%2Crs%2Csc%2Csl%2Csg%2Csk%2Csi%2Cso%2Cza%2Ces%2Clk%2Csd%2Cse%2Cch%2Csy%2Ctw%2Ctj%2Ctz%2Cth%2Ctl%2Ctg%2Ctn%2Ctr%2Cug%2Cua%2Cae%2Cgb%2Cus%2Cuy%2Cuz%2Cve%2Cvn%2Cvi%2Cye%2Czw';
 
 // ========== STATE ==========
 let proxyPool = [];
@@ -28,58 +31,46 @@ const USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
 ];
 
-// ========== PROXY FETCHING (using official Proxifly API) ==========
+// ========== PROXY FETCHING ==========
 async function fetchProxies() {
     try {
-        const proxifly = new Proxifly({ apiKey: PROXIFLY_API_KEY });
-        const result = await proxifly.getProxy({
-            protocol: 'http',            // Only HTTP (axios-compatible)
-            https: true,
-            quantity: 20,                // 20 proxies per batch
-            format: 'json'               // Default, but explicit
-        });
+        const resp = await axios.get(PROXY_API_URL, { timeout: 20000 });
+        // Response shape: { "proxies": ["ip:port", "ip:port", ...] }
+        let data = resp.data;
 
-        // --- Handle response shape ---
-        let proxies = [];
-
-        if (Array.isArray(result)) {
-            // Multiple proxies: array of proxy objects
-            proxies = result.map(p => p.proxy); // e.g. "http://ip:port"
-        } else if (result && result.proxy) {
-            // Single proxy: object with .proxy string
-            proxies = [result.proxy];
-        } else if (result && Array.isArray(result.proxies)) {
-            // Fallback: some versions return { proxies: [...] }
-            proxies = result.proxies.map(p => p.proxy || `${p.protocol}://${p.ip}:${p.port}`);
+        // Some API versions return an array directly
+        let list = [];
+        if (Array.isArray(data)) {
+            list = data;
+        } else if (data && Array.isArray(data.proxies)) {
+            list = data.proxies;
+        } else if (data && Array.isArray(data.data)) {
+            list = data.data;
         } else {
-            console.log('[!] Unexpected response shape from Proxifly');
-            console.dir(result, { depth: 3 });
+            console.log('[!] Unexpected response shape from ProxyScrape');
+            console.dir(data, { depth: 2 });
             return [];
         }
 
-        // Filter out non-HTTP proxies (just in case)
-        proxies = proxies.filter(p => p.startsWith('http://') || p.startsWith('https://'));
+        // Each entry is "ip:port" → convert to "http://ip:port"
+        const proxies = list
+            .filter(entry => typeof entry === 'string' && entry.includes(':'))
+            .map(entry => `http://${entry}`)
+            .filter(Boolean);
 
         // Remove duplicates
-        proxies = [...new Set(proxies)];
+        const unique = [...new Set(proxies)];
 
-        if (proxies.length > 0) {
-            console.log(`[i] Fetched ${proxies.length} HTTP proxies from Proxifly`);
-            console.log(`   Example: ${proxies[0]}`);
+        if (unique.length > 0) {
+            console.log(`[i] Fetched ${unique.length} HTTP proxies from ProxyScrape`);
+            console.log(`   Example: ${unique[0]}`);
         } else {
-            console.log('[!] No usable HTTP proxies returned.');
+            console.log('[!] ProxyScrape returned no valid proxies.');
         }
 
-        return proxies;
+        return unique;
     } catch (err) {
-        console.error('[!] Proxifly fetch error:', err?.message);
-        if (err?.response?.data) {
-            console.error('   Response data:', err.response.data);
-        }
-        if (err?.message?.includes('out of daily requests')) {
-            console.error('[✗] Proxifly daily quota exhausted.');
-            process.exit(1);
-        }
+        console.error('[!] ProxyScrape fetch error:', err?.message);
         return [];
     }
 }
@@ -92,11 +83,11 @@ async function refreshProxyPool() {
     } else {
         console.log('[!] No proxies returned – keeping current pool.');
     }
-    // Shuffle for randomness
+    // Shuffle
     proxyPool.sort(() => Math.random() - 0.5);
 }
 
-// ========== EXTRACT IP FROM PROXY STRING ==========
+// ========== EXTRACT IP ==========
 function extractIp(proxyStr) {
     if (!proxyStr) return 'direct';
     const parts = proxyStr.split('://');
@@ -109,7 +100,7 @@ async function sendView() {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = extractIp(proxy);
 
-    // Build proxy agent for axios
+    // Build proxy agent
     let proxyAgent = null;
     if (proxy) {
         const proxyUrl = new URL(proxy);
@@ -163,11 +154,10 @@ function sleep(ms) {
 // ========== MAIN LOOP ==========
 async function main() {
     console.log('='.repeat(60));
-    console.log('🎯 guns.lol View Bot (Node.js + Proxifly v3.0.1)');
+    console.log('🎯 guns.lol View Bot (Node.js + ProxyScrape Free Proxies)');
     console.log(`   Target: ${TARGET_URL}`);
     console.log(`   Goal: ${TOTAL_VIEWS} views`);
     console.log(`   Delay: ${DELAY_MS/1000}s`);
-    console.log(`   Proxifly API Key: ${PROXIFLY_API_KEY.slice(0, 8)}...`);
     console.log('='.repeat(60));
 
     console.log('[i] Fetching initial proxy pool...');
