@@ -13,7 +13,7 @@ WORKERS = int(os.getenv("WORKERS", "1"))                  # Keep 1 for sequentia
 DELAY = float(os.getenv("DELAY", "5"))                    # Seconds between requests
 RETRIES = int(os.getenv("RETRIES", "3"))                  # Retry on error/429
 PROXY_API = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
-PROXY_REFRESH_INTERVAL = int(os.getenv("PROXY_REFRESH_INTERVAL", "20"))  # Refresh proxies every N requests
+PROXY_REFRESH_INTERVAL = int(os.getenv("PROXY_REFRESH_INTERVAL", "50"))  # Refresh proxies every N requests
 
 # ========== GLOBALS ==========
 proxy_pool = []
@@ -21,7 +21,7 @@ successful_views = 0
 failed_views = 0
 lock = threading.Lock()
 stop_flag = threading.Event()
-request_counter = 0  # Tracks total requests to decide when to refresh proxies
+request_counter = 0
 
 # ========== USER AGENTS ==========
 USER_AGENTS = [
@@ -36,10 +36,8 @@ def fetch_proxies():
     try:
         resp = requests.get(PROXY_API, timeout=15)
         if resp.status_code == 200:
-            # API returns one proxy per line, format: protocol://ip:port
             proxies = [line.strip() for line in resp.text.splitlines() if line.strip()]
-            # Remove duplicates
-            proxies = list(set(proxies))
+            proxies = list(set(proxies))  # remove duplicates
             return proxies
         else:
             print(f"[!] Proxy API returned status {resp.status_code}")
@@ -59,21 +57,37 @@ def refresh_proxy_pool():
         print("[!] Proxy fetch returned empty list. Keeping current pool.")
     random.shuffle(proxy_pool)
 
+# ========== HELPER: Extract IP from proxy string ==========
+def extract_ip(proxy_str):
+    """Extract IP from 'protocol://ip:port' or return 'direct'."""
+    if not proxy_str:
+        return "direct"
+    # Remove protocol prefix
+    if "://" in proxy_str:
+        ip_port = proxy_str.split("://")[1]
+    else:
+        ip_port = proxy_str
+    # Remove port
+    if ":" in ip_port:
+        ip = ip_port.split(":")[0]
+    else:
+        ip = ip_port
+    return ip
+
 # ========== SINGLE VIEW REQUEST ==========
 def send_view():
-    """Send one view request using a random proxy. Returns True if 200."""
+    """Send one view request using a random proxy.
+    Returns (success: bool, proxy_ip: str)"""
     global proxy_pool, request_counter
 
-    # Rotate IP: pick a random proxy
     proxy = None
+    proxy_ip = "direct"
     if proxy_pool:
         proxy = random.choice(proxy_pool)
-    else:
-        print("[!] No proxies available – will use direct connection (likely blocked)")
+        proxy_ip = extract_ip(proxy)
     
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
-    # Browser-like headers
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -88,19 +102,17 @@ def send_view():
         try:
             resp = requests.get(TARGET_URL, headers=headers, proxies=proxies, timeout=15)
             if resp.status_code == 200:
-                return True
+                return (True, proxy_ip)
             elif resp.status_code == 429:
-                # Rate limited – exponential backoff
                 wait = min(2 ** attempt + random.uniform(0, 1), 10)
                 time.sleep(wait)
                 continue
             else:
-                # 403, 5xx, etc.
-                return False
+                return (False, proxy_ip)
         except Exception as e:
             time.sleep(1)
             continue
-    return False
+    return (False, proxy_ip)
 
 # ========== WORKER LOOP ==========
 def worker_thread(worker_id):
@@ -110,33 +122,30 @@ def worker_thread(worker_id):
             if successful_views >= TOTAL_VIEWS:
                 stop_flag.set()
                 return
-        # Refresh proxy pool every PROXY_REFRESH_INTERVAL requests
+        # Refresh proxy pool periodically
         with lock:
             request_counter += 1
             if request_counter % PROXY_REFRESH_INTERVAL == 0:
                 refresh_proxy_pool()
 
-        # Send one view
-        success = send_view()
+        success, proxy_ip = send_view()
         with lock:
             if success:
                 successful_views += 1
-                print(f"[Worker {worker_id}] ✅ View #{successful_views} added | IP rotated | Next in {DELAY}s")
+                print(f"[Worker {worker_id}] ✅ View #{successful_views} added | IP: {proxy_ip} | Next in {DELAY}s")
             else:
                 failed_views += 1
-                print(f"[Worker {worker_id}] ❌ Failed (total fails: {failed_views}) | Next in {DELAY}s")
-        # Check if done
+                print(f"[Worker {worker_id}] ❌ Failed (total fails: {failed_views}) | IP: {proxy_ip} | Next in {DELAY}s")
         if successful_views >= TOTAL_VIEWS:
             stop_flag.set()
             return
-        # Wait the delay
         time.sleep(DELAY)
 
 # ========== MAIN ==========
 def main():
     global successful_views, failed_views
     print("=" * 60)
-    print(f"🎯 guns.lol View Bot (Free Proxy API)")
+    print(f"🎯 guns.lol View Bot (Live IP logging)")
     print(f"   Target: {TARGET_URL}")
     print(f"   Goal: {TOTAL_VIEWS} views")
     print(f"   Delay: {DELAY}s between requests")
@@ -144,7 +153,6 @@ def main():
     print(f"   Proxy API: {PROXY_API}")
     print("=" * 60)
     
-    # Initial proxy fetch
     print("[i] Fetching initial proxy pool...")
     refresh_proxy_pool()
 
