@@ -30,7 +30,6 @@ function saveDailyViews() {
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(dailyViews, null, 2)); } catch (e) {}
 }
 
-// ========== LOAD PROXIES (no validation – use all as provided) ==========
 function loadProxiesFromFile() {
     try {
         const content = fs.readFileSync(PROXY_FILE, 'utf8');
@@ -45,7 +44,7 @@ function loadProxiesFromFile() {
     }
 }
 
-// ========== VIEW REQUEST (with redirect handling) ==========
+// ========== VIEW REQUEST ==========
 async function sendView(targetUrl, onLog, useProxy = true) {
     let proxy = null;
     if (useProxy && proxyPool.length > 0) {
@@ -76,8 +75,8 @@ async function sendView(targetUrl, onLog, useProxy = true) {
             },
             httpsAgent: proxyAgent,
             timeout: PER_REQUEST_TIMEOUT,
-            maxRedirects: 0,                          // DO NOT follow redirects – treat any status as success
-            validateStatus: () => true,                // Accept any status code (including 3xx)
+            maxRedirects: 0,
+            validateStatus: () => true, // Accept any status code
         };
 
         try {
@@ -87,10 +86,8 @@ async function sendView(targetUrl, onLog, useProxy = true) {
             );
             const resp = await Promise.race([requestPromise, timeoutPromise]);
 
-            // Treat any HTTP response (2xx, 3xx, 4xx, 5xx) as a "success" for the view bot
-            const success = resp.status >= 200 && resp.status < 600; // always true because of validateStatus, but keep as flag
             const log = {
-                proxy: proxy || 'none', ip, status: resp.status, success: true, // always mark success if we got a response
+                proxy: proxy || 'none', ip, status: resp.status, success: true,
                 attempt: attempt + 1, timestamp: new Date().toISOString(), userAgent: userAgent.slice(0, 50),
             };
             if (onLog) onLog(log);
@@ -140,7 +137,7 @@ client.on('interactionCreate', async interaction => {
 
     // ========== /views ==========
     if (commandName === 'views') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply(); // Public reply (no flags)
 
         const targetUser = interaction.options.getString('user');
         const amount = interaction.options.getInteger('amount');
@@ -159,7 +156,7 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply('❌ Log channel not found. Contact admin.');
         }
 
-        // Initial embed
+        // Initial embed (public)
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('🎯 guns.lol View Bot – Running')
@@ -177,37 +174,42 @@ client.on('interactionCreate', async interaction => {
 
         const reply = await interaction.editReply({ embeds: [embed] });
 
-        // Header log
-        const headerEmbed = new EmbedBuilder()
-            .setColor(0x00FF00)
-            .setTitle('🚀 View Bot – Started')
-            .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}`)
-            .setThumbnail(THUMBNAIL_URL)
-            .setTimestamp();
-        await logChannel.send({ embeds: [headerEmbed] });
+        // Header log (with try/catch to avoid breaking loop)
+        try {
+            const headerEmbed = new EmbedBuilder()
+                .setColor(0x00FF00)
+                .setTitle('🚀 View Bot – Started')
+                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}`)
+                .setThumbnail(THUMBNAIL_URL)
+                .setTimestamp();
+            await logChannel.send({ embeds: [headerEmbed] });
+        } catch (e) {
+            console.error('[!] Failed to send header log:', e.message);
+        }
 
         let successful = 0;
         let failed = 0;
         let logBatches = [];
         const useProxy = proxyPool.length > 0;
 
-        try {
-            for (let i = 0; i < viewsToDo; i++) {
-                const result = await sendView(targetUrl, (logEntry) => {
-                    const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
-                    logBatches.push(line);
-                }, useProxy);
+        // Run the full loop – each iteration is protected
+        for (let i = 0; i < viewsToDo; i++) {
+            const result = await sendView(targetUrl, (logEntry) => {
+                const line = `\`${logEntry.timestamp}\` | **IP:** ${logEntry.ip} | **Proxy:** \`${logEntry.proxy}\` | **Status:** ${logEntry.status} | **Success:** ${logEntry.success ? '✅' : '❌'} | **Attempt:** ${logEntry.attempt}`;
+                logBatches.push(line);
+            }, useProxy);
 
-                if (result.success) successful++;
-                else failed++;
+            if (result.success) successful++;
+            else failed++;
 
-                dailyViews[key] = (dailyViews[key] || 0) + 1;
-                saveDailyViews();
+            dailyViews[key] = (dailyViews[key] || 0) + 1;
+            saveDailyViews();
 
-                const statusText = result.success
-                    ? `✅ View #${i + 1} added (status: ${result.status})`
-                    : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
+            const statusText = result.success
+                ? `✅ View #${i + 1} added (status: ${result.status})`
+                : `❌ Failed (IP: ${result.ip}, status: ${result.status})`;
 
+            try {
                 const updatedEmbed = EmbedBuilder.from(embed)
                     .setFields(
                         { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
@@ -218,71 +220,82 @@ client.on('interactionCreate', async interaction => {
                         { name: '⏱️ Status', value: statusText, inline: false },
                     );
                 await reply.edit({ embeds: [updatedEmbed] });
+            } catch (e) {
+                console.error('[!] Failed to update embed:', e.message);
+            }
 
-                if (logBatches.length >= 10) {
+            // Batch log sends (with try/catch)
+            if (logBatches.length >= 10) {
+                try {
                     const batch = logBatches.join('\n');
                     const logEmbed = new EmbedBuilder()
                         .setColor(0x3498DB)
                         .setDescription(batch.slice(0, 4000))
                         .setTimestamp();
                     await logChannel.send({ embeds: [logEmbed] });
-                    logBatches = [];
+                } catch (e) {
+                    console.error('[!] Failed to send batch log:', e.message);
                 }
-
-                if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
+                logBatches = [];
             }
-        } catch (err) {
-            console.error('[FATAL] View loop error:', err);
-            const errorEmbed = EmbedBuilder.from(embed)
-                .setColor(0xFF0000)
-                .setTitle('❌ View Bot – Crashed')
-                .setDescription(`Fatal error: ${err.message}`)
-                .setTimestamp();
-            await reply.edit({ embeds: [errorEmbed] }).catch(() => {});
-            await logChannel.send({ content: `❌ **FATAL ERROR:** ${err.message}`, embeds: [] });
+
+            if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
         }
 
         // Send remaining logs
         if (logBatches.length > 0) {
-            const batch = logBatches.join('\n');
-            const logEmbed = new EmbedBuilder()
-                .setColor(0x3498DB)
-                .setDescription(batch.slice(0, 4000))
-                .setTimestamp();
-            await logChannel.send({ embeds: [logEmbed] });
+            try {
+                const batch = logBatches.join('\n');
+                const logEmbed = new EmbedBuilder()
+                    .setColor(0x3498DB)
+                    .setDescription(batch.slice(0, 4000))
+                    .setTimestamp();
+                await logChannel.send({ embeds: [logEmbed] });
+            } catch (e) {
+                console.error('[!] Failed to send final batch log:', e.message);
+            }
         }
 
         // Final summary log
-        const summaryEmbed = new EmbedBuilder()
-            .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
-            .setTitle('🏁 View Bot – Finished')
-            .setThumbnail(THUMBNAIL_URL)
-            .addFields(
-                { name: '✅ Successful', value: `${successful}`, inline: true },
-                { name: '❌ Failed', value: `${failed}`, inline: true },
-                { name: 'User Today', value: `${dailyViews[key]}/${MAX_VIEWS_PER_USER_PER_DAY}`, inline: true },
-                { name: 'Requested by', value: requester.tag, inline: false },
-            )
-            .setTimestamp();
-        await logChannel.send({ embeds: [summaryEmbed] });
+        try {
+            const summaryEmbed = new EmbedBuilder()
+                .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
+                .setTitle('🏁 View Bot – Finished')
+                .setThumbnail(THUMBNAIL_URL)
+                .addFields(
+                    { name: '✅ Successful', value: `${successful}`, inline: true },
+                    { name: '❌ Failed', value: `${failed}`, inline: true },
+                    { name: 'User Today', value: `${dailyViews[key]}/${MAX_VIEWS_PER_USER_PER_DAY}`, inline: true },
+                    { name: 'Requested by', value: requester.tag, inline: false },
+                )
+                .setTimestamp();
+            await logChannel.send({ embeds: [summaryEmbed] });
+        } catch (e) {
+            console.error('[!] Failed to send summary log:', e.message);
+        }
 
-        // Final embed
-        const finalEmbed = EmbedBuilder.from(embed)
-            .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
-            .setTitle('🏁 View Bot – Completed')
-            .setFields(
-                { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
-                { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
-                { name: '📊 Progress', value: `${successful}/${viewsToDo}`, inline: false },
-                { name: '✅ Successful', value: `${successful}`, inline: true },
-                { name: '❌ Failed', value: `${failed}`, inline: true },
-                { name: '⏱️ Status', value: '✅ Finished!', inline: false },
-            );
-        await reply.edit({ embeds: [finalEmbed] });
+        // Final embed (public)
+        try {
+            const finalEmbed = EmbedBuilder.from(embed)
+                .setColor(successful > 0 ? 0x00FF00 : 0xFF0000)
+                .setTitle('🏁 View Bot – Completed')
+                .setFields(
+                    { name: '👤 Target', value: `[${targetUser}](${targetUrl})`, inline: true },
+                    { name: '👥 Ran by', value: `${requester.tag} (${requester.id})`, inline: true },
+                    { name: '📊 Progress', value: `${successful}/${viewsToDo}`, inline: false },
+                    { name: '✅ Successful', value: `${successful}`, inline: true },
+                    { name: '❌ Failed', value: `${failed}`, inline: true },
+                    { name: '⏱️ Status', value: '✅ Finished!', inline: false },
+                );
+            await reply.edit({ embeds: [finalEmbed] });
+        } catch (e) {
+            console.error('[!] Failed to send final embed:', e.message);
+        }
     }
 
-    // ========== /status ==========
+    // ========== /status, /proxycount, /help, /reset ==========
     else if (commandName === 'status') {
+        // ... (unchanged, but ensure ephemeral)
         const today = TODAY();
         const key = `${requester.id}_${today}`;
         const used = dailyViews[key] || 0;
@@ -300,7 +313,6 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
-    // ========== /proxycount ==========
     else if (commandName === 'proxycount') {
         const count = proxyPool.length;
         const embed = new EmbedBuilder()
@@ -315,7 +327,6 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
-    // ========== /help ==========
     else if (commandName === 'help') {
         const embed = new EmbedBuilder()
             .setColor(0x2ECC71)
@@ -332,7 +343,6 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
-    // ========== /reset (admin) ==========
     else if (commandName === 'reset') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return interaction.reply({ content: '❌ Admin only.', flags: MessageFlags.Ephemeral });
