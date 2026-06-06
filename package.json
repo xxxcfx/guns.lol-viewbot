@@ -1,7 +1,7 @@
 {
   "name": "guns-lol-viewbot",
-  "version": "5.0.0",
-  "description": "guns.lol view bot using free ProxyScrape HTTP proxies",
+  "version": "6.0.0",
+  "description": "guns.lol view bot using local http.txt proxies",
   "main": "viewbot.js",
   "scripts": {
     "start": "node viewbot.js"
