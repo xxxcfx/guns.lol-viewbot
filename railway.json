@@ -1,0 +1,10 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "python viewbot.py",
+    "restartPolicyType": "NEVER"   // bot runs once, won't restart automatically
+  }
+}
