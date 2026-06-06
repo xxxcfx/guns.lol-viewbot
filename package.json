@@ -1,13 +1,15 @@
 {
   "name": "guns-lol-viewbot",
-  "version": "1.0.0",
-  "description": "guns.lol view bot using Proxifly residential proxies",
+  "version": "2.0.0",
+  "description": "guns.lol view bot using Proxifly HTTP proxies",
   "main": "viewbot.js",
   "scripts": {
     "start": "node viewbot.js"
   },
   "dependencies": {
     "axios": "^1.6.5",
+    "http-proxy-agent": "^7.0.0",
+    "https-proxy-agent": "^7.0.0",
     "proxifly": "^1.0.0"
   }
 }
