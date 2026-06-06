@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 # ----- Configuration -----
-TARGET_URL = os.getenv("TARGET_URL", "https://guns.lol/example")
+TARGET_URL = os.getenv("TARGET_URL", "https://guns.lol/f7tv")
 THREADS = int(os.getenv("THREADS", "50"))          # Number of concurrent threads
 REQUESTS_PER_THREAD = int(os.getenv("REQS_PER_THREAD", "100"))  # How many requests each thread sends
 DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY", "0")) # Delay in seconds between requests (0 = no delay)
