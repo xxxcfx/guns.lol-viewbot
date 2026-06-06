@@ -9,10 +9,10 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN';
 const ALLOWED_CHANNEL_ID = '1512808669522165832';
 const LOG_CHANNEL_ID = '1512806516145520670';
 const MAX_VIEWS_PER_USER_PER_DAY = 50;
-const DELAY_BETWEEN_VIEWS = 500;  // 0.5 seconds between views
+const DELAY_BETWEEN_VIEWS = 5000;  // 5 seconds (stay on site)
 const PROXY_FILE = 'http.txt';
 const THUMBNAIL_URL = 'https://cdn.discordapp.com/attachments/1502245820114669579/1512809050394464397/download_2.jpg?ex=6a2570b8&is=6a241f38&hm=cd678daa95c326ff11313e17167ee91d5caeafbf1329e1fce1d0da954c3d9f14&';
-const PER_REQUEST_TIMEOUT = 8000;  // 8 seconds
+const PER_REQUEST_TIMEOUT = 10000; // 10 seconds (enough for a 5-second stay)
 
 // ========== STATE ==========
 let proxyPool = [];
@@ -45,13 +45,11 @@ function loadProxiesFromFile() {
 
 // ========== VIEW REQUEST WITH PROXY + DIRECT FALLBACK ==========
 async function sendView(targetUrl, onLog) {
-    // Decide order: try proxy first (if available), then fallback to direct
     const attempts = [];
     if (proxyPool.length > 0) {
         const proxy = proxyPool[Math.floor(Math.random() * proxyPool.length)];
         attempts.push({ proxy, type: 'proxy' });
     }
-    // Always add direct as last resort
     attempts.push({ proxy: null, type: 'direct' });
 
     for (const { proxy, type } of attempts) {
@@ -102,8 +100,7 @@ async function sendView(targetUrl, onLog) {
             };
             if (onLog) onLog(log);
             console.error(`   [${type}] Failed: ${err.message}`);
-            // If proxy fails, continue to next attempt (direct)
-            if (type === 'direct') break; // last resort already, break out
+            if (type === 'direct') break;
         }
     }
     return { success: false, ip: 'direct', proxy: null, status: 'error' };
@@ -173,7 +170,7 @@ client.on('interactionCreate', async interaction => {
                 { name: '❌ Failed', value: '0', inline: true },
                 { name: '⏱️ Status', value: '🎬 Starting...', inline: false },
             )
-            .setFooter({ text: `Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} views/user` })
+            .setFooter({ text: `Daily limit: ${MAX_VIEWS_PER_USER_PER_DAY} views/user `})
             .setTimestamp();
 
         const reply = await interaction.editReply({ embeds: [embed] });
@@ -183,7 +180,7 @@ client.on('interactionCreate', async interaction => {
             const headerEmbed = new EmbedBuilder()
                 .setColor(0x00FF00)
                 .setTitle('🚀 View Bot – Started')
-                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}`)
+                .setDescription(`**Requested by:** ${requester.tag}\n**Target:** ${targetUrl}\n**Amount:** ${viewsToDo}\n**Proxies loaded:** ${proxyPool.length}\n**Dwell time:** 5 seconds per view`)
                 .setThumbnail(THUMBNAIL_URL)
                 .setTimestamp();
             await logChannel.send({ embeds: [headerEmbed] });
@@ -195,7 +192,7 @@ client.on('interactionCreate', async interaction => {
         let failed = 0;
         let logBatches = [];
 
-        // Safe loop that catches any error to prevent crash
+        // Safe loop
         try {
             for (let i = 0; i < viewsToDo; i++) {
                 const result = await sendView(targetUrl, (logEntry) => {
@@ -243,17 +240,17 @@ client.on('interactionCreate', async interaction => {
                     logBatches = [];
                 }
 
+                // 🕐 WAIT 5 SECONDS BEFORE NEXT VIEW (simulate staying on site)
                 if (i < viewsToDo - 1) await sleep(DELAY_BETWEEN_VIEWS);
             }
         } catch (e) {
-            // Catch any unexpected error from the loop itself
             console.error('[FATAL] Loop error:', e);
             try {
                 await reply.edit({ content: `❌ Fatal error: ${e.message}` });
             } catch (_) {}
         }
 
-        // Send remaining logs safely
+        // Send remaining logs
         if (logBatches.length > 0) {
             try {
                 const batch = logBatches.join('\n');
@@ -304,7 +301,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ========== Other commands (unchanged) ==========
+    // ========== Other commands ==========
     else if (commandName === 'status') {
         const today = TODAY();
         const key = `${requester.id}_${today}`;
