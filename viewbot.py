@@ -1,6 +1,7 @@
 const Proxifly = require('proxifly');
 const axios = require('axios');
-const fs = require('fs');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { HttpProxyAgent } = require('http-proxy-agent');
 
 // ========== CONFIGURATION ==========
 const TARGET_USERNAME = 'f7tv';
@@ -9,7 +10,7 @@ const TARGET_URL = `https://guns.lol/${TARGET_USERNAME}`;
 const TOTAL_VIEWS = parseInt(process.env.TOTAL_VIEWS || '200');
 const DELAY_MS = parseInt(process.env.DELAY_MS || '5000'); // 5 seconds
 const RETRIES = parseInt(process.env.RETRIES || '3');
-const PROXY_REFRESH_INTERVAL = parseInt(process.env.PROXY_REFRESH_INTERVAL || '20'); // refresh proxies every 20 views
+const PROXY_REFRESH_INTERVAL = parseInt(process.env.PROXY_REFRESH_INTERVAL || '20');
 
 const PROXIFLY_API_KEY = process.env.PROXIFLY_API_KEY || '3wjHnRJ6pgxMDrwvpkykFSv3jRGNnSqh4VTbJ8kfSBZp';
 
@@ -27,21 +28,31 @@ const USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
 ];
 
-// ========== PROXY FETCHING ==========
+// ========== PROXY FETCHING (ONLY HTTP) ==========
 async function fetchProxies() {
     try {
         const proxifly = new Proxifly({ apiKey: PROXIFLY_API_KEY });
         const result = await proxifly.getProxy({
             countries: ['US', 'RU'],
-            protocol: ['http', 'socks4'],
+            protocol: ['http'],          // ONLY HTTP – SOCKS4 not supported by axios
             quantity: 20,
             https: true
         });
-        // Result is an array of objects: [ { ip, port, protocol, ... }, ... ]
+        // Check if result is an array of objects
+        if (!Array.isArray(result) || result.length === 0) {
+            console.log('[!] Proxifly returned empty or invalid response.');
+            return [];
+        }
+        // Map to proxy strings
         const proxies = result.map(p => `${p.protocol}://${p.ip}:${p.port}`);
         return proxies;
     } catch (err) {
         console.error(`[!] Proxifly fetch error: ${err.message}`);
+        // If "out of daily requests" is detected, log clearly
+        if (err.message && err.message.includes('out of daily requests')) {
+            console.error('[✗] You have exceeded your Proxifly daily quota.');
+            process.exit(1);
+        }
         return [];
     }
 }
@@ -51,14 +62,16 @@ async function refreshProxyPool() {
     if (newProxies.length > 0) {
         proxyPool = newProxies;
         console.log(`[i] Proxy pool refreshed: ${proxyPool.length} proxies`);
+        // Log first proxy as example
+        console.log(`   Example proxy: ${proxyPool[0]}`);
     } else {
         console.log('[!] No proxies returned – keeping current pool.');
     }
-    // Shuffle for randomness
+    // Shuffle
     proxyPool.sort(() => Math.random() - 0.5);
 }
 
-// ========== HELPER ==========
+// ========== EXTRACT IP FROM PROXY STRING ==========
 function extractIp(proxyStr) {
     if (!proxyStr) return 'direct';
     const parts = proxyStr.split('://');
@@ -71,6 +84,18 @@ async function sendView() {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = extractIp(proxy);
 
+    // Build proxy agent if proxy exists
+    let proxyAgent = null;
+    if (proxy) {
+        // proxy format: http://ip:port
+        const proxyUrl = new URL(proxy);
+        if (proxyUrl.protocol === 'http:') {
+            proxyAgent = new HttpProxyAgent(proxy);
+        } else if (proxyUrl.protocol === 'https:') {
+            proxyAgent = new HttpsProxyAgent(proxy);
+        }
+    }
+
     const config = {
         headers: {
             'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
@@ -81,7 +106,8 @@ async function sendView() {
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
         },
-        proxy: proxy ? { host: proxy.split('://')[1].split(':')[0], port: parseInt(proxy.split(':')[2]) } : undefined,
+        httpAgent: proxyAgent,
+        httpsAgent: proxyAgent,
         timeout: 15000,
     };
 
@@ -92,16 +118,18 @@ async function sendView() {
                 return { success: true, ip };
             } else if (resp.status === 429) {
                 const wait = Math.min(Math.pow(2, attempt) + Math.random(), 10) * 1000;
+                console.log(`   ⏳ 429 rate limit – waiting ${wait/1000}s`);
                 await sleep(wait);
                 continue;
             } else {
-                return { success: false, ip };
+                return { success: false, ip, status: resp.status };
             }
         } catch (err) {
+            // Error can be network, timeout, etc.
             await sleep(1000);
         }
     }
-    return { success: false, ip };
+    return { success: false, ip, status: 'error' };
 }
 
 // ========== SLEEP ==========
@@ -112,7 +140,7 @@ function sleep(ms) {
 // ========== MAIN LOOP ==========
 async function main() {
     console.log('='.repeat(60));
-    console.log('🎯 guns.lol View Bot (Node.js + Proxifly)');
+    console.log('🎯 guns.lol View Bot (Node.js + Proxifly – HTTP only)');
     console.log(`   Target: ${TARGET_URL}`);
     console.log(`   Goal: ${TOTAL_VIEWS} views`);
     console.log(`   Delay: ${DELAY_MS/1000}s`);
@@ -122,24 +150,23 @@ async function main() {
     console.log('[i] Fetching initial proxy pool...');
     await refreshProxyPool();
     if (proxyPool.length === 0) {
-        console.log('[!] Warning: No proxies loaded. Continuing without proxies.');
+        console.log('[!] Warning: No proxies loaded. Continuing without proxies (likely blocked).');
     }
 
     while (!stopFlag && successfulViews < TOTAL_VIEWS) {
-        // Refresh proxies periodically
         requestCount++;
         if (requestCount % PROXY_REFRESH_INTERVAL === 0) {
             console.log('[i] Refreshing proxy pool...');
             await refreshProxyPool();
         }
 
-        const { success, ip } = await sendView();
+        const { success, ip, status } = await sendView();
         if (success) {
             successfulViews++;
             console.log(`✅ View #${successfulViews} added | IP: ${ip} | Next in ${DELAY_MS/1000}s`);
         } else {
             failedViews++;
-            console.log(`❌ Failed (total fails: ${failedViews}) | IP: ${ip} | Next in ${DELAY_MS/1000}s`);
+            console.log(`❌ Failed (total fails: ${failedViews}) | IP: ${ip} | Status: ${status || 'unknown'} | Next in ${DELAY_MS/1000}s`);
         }
 
         if (successfulViews >= TOTAL_VIEWS) {
