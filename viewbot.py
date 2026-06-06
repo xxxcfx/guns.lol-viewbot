@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { HttpProxyAgent } = require('http-proxy-agent');
+const fs = require('fs');
 
 // ========== CONFIG ==========
 const TARGET_USERNAME = 'f7tv';
@@ -9,13 +10,8 @@ const TARGET_URL = `https://guns.lol/${TARGET_USERNAME}`;
 const TOTAL_VIEWS = parseInt(process.env.TOTAL_VIEWS || '200');
 const DELAY_MS = parseInt(process.env.DELAY_MS || '5000'); // 5 seconds
 const RETRIES = parseInt(process.env.RETRIES || '3');
-const PROXY_REFRESH_INTERVAL = parseInt(process.env.PROXY_REFRESH_INTERVAL || '20');
 
-// ProxyScrape API (free, returns HTTP proxies in JSON)
-const PROXY_API_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get' +
-  '?request=display_proxies&proxy_format=ipport&format=json' +
-  '&protocol=http' +
-  '&country=af%2Cal%2Cdz%2Cad%2Cao%2Car%2Cam%2Cau%2Cat%2Caz%2Cbd%2Cby%2Cbe%2Cbj%2Cbm%2Cbt%2Cbo%2Cbw%2Cbg%2Cbf%2Cbi%2Ckh%2Ccm%2Cca%2Ctd%2Ccl%2Ccn%2Cco%2Ccg%2Ccr%2Chr%2Ccy%2Ccz%2Cdk%2Cdo%2Cec%2Ceg%2Csv%2Cgq%2Cee%2Csz%2Cet%2Cfj%2Cfi%2Cfr%2Cgm%2Cge%2Cde%2Cgh%2Cgi%2Cgr%2Cgu%2Cgt%2Cgn%2Cht%2Chn%2Chk%2Chu%2Cin%2Cid%2Cir%2Ciq%2Cie%2Cil%2Cit%2Cjm%2Cjp%2Cjo%2Ckz%2Cke%2Ckr%2Ckg%2Clv%2Clb%2Cls%2Clt%2Cmg%2Cmw%2Cmy%2Cmv%2Cml%2Cmt%2Cmu%2Cmx%2Cmd%2Cmn%2Cme%2Cma%2Cmz%2Cmm%2Cna%2Cnp%2Cnl%2Cnz%2Cni%2Cng%2Cmk%2Cno%2Cpk%2Cps%2Cpa%2Cpy%2Cpe%2Cph%2Cpl%2Cpt%2Cpr%2Cqa%2Cro%2Crw%2Ckn%2Csa%2Csn%2Crs%2Csc%2Csl%2Csg%2Csk%2Csi%2Cso%2Cza%2Ces%2Clk%2Csd%2Cse%2Cch%2Csy%2Ctw%2Ctj%2Ctz%2Cth%2Ctl%2Ctg%2Ctn%2Ctr%2Cug%2Cua%2Cae%2Cgb%2Cus%2Cuy%2Cuz%2Cve%2Cvn%2Cvi%2Cye%2Czw';
+const PROXY_FILE = 'http.txt';  // File must be in the same directory
 
 // ========== STATE ==========
 let proxyPool = [];
@@ -31,63 +27,43 @@ const USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
 ];
 
-// ========== PROXY FETCHING ==========
-async function fetchProxies() {
+// ========== LOAD PROXIES FROM FILE ==========
+function loadProxiesFromFile() {
     try {
-        const resp = await axios.get(PROXY_API_URL, { timeout: 20000 });
-        // Response shape: { "proxies": ["ip:port", "ip:port", ...] }
-        let data = resp.data;
+        const content = fs.readFileSync(PROXY_FILE, 'utf8');
+        const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
 
-        // Some API versions return an array directly
-        let list = [];
-        if (Array.isArray(data)) {
-            list = data;
-        } else if (data && Array.isArray(data.proxies)) {
-            list = data.proxies;
-        } else if (data && Array.isArray(data.data)) {
-            list = data.data;
-        } else {
-            console.log('[!] Unexpected response shape from ProxyScrape');
-            console.dir(data, { depth: 2 });
-            return [];
-        }
-
-        // Each entry is "ip:port" → convert to "http://ip:port"
-        const proxies = list
-            .filter(entry => typeof entry === 'string' && entry.includes(':'))
-            .map(entry => `http://${entry}`)
-            .filter(Boolean);
+        // Each line must be "ip:port"
+        const proxies = lines
+            .map(line => line.trim())
+            .filter(line => line.includes(':'))
+            .map(line => `http://${line}`);  // convert to http://ip:port
 
         // Remove duplicates
         const unique = [...new Set(proxies)];
 
+        console.log(`[i] Loaded ${unique.length} HTTP proxies from ${PROXY_FILE}`);
         if (unique.length > 0) {
-            console.log(`[i] Fetched ${unique.length} HTTP proxies from ProxyScrape`);
             console.log(`   Example: ${unique[0]}`);
         } else {
-            console.log('[!] ProxyScrape returned no valid proxies.');
+            console.log('[!] No valid proxies found in file.');
         }
 
         return unique;
     } catch (err) {
-        console.error('[!] ProxyScrape fetch error:', err?.message);
+        console.error(`[!] Failed to read ${PROXY_FILE}: ${err.message}`);
         return [];
     }
 }
 
-async function refreshProxyPool() {
-    const newProxies = await fetchProxies();
-    if (newProxies.length > 0) {
-        proxyPool = newProxies;
-        console.log(`[i] Proxy pool refreshed: ${proxyPool.length} proxies`);
-    } else {
-        console.log('[!] No proxies returned – keeping current pool.');
-    }
-    // Shuffle
+// ========== INITIAL PROXY POOL ==========
+function refreshProxyPool() {
+    proxyPool = loadProxiesFromFile();
+    // Shuffle for randomness
     proxyPool.sort(() => Math.random() - 0.5);
 }
 
-// ========== EXTRACT IP ==========
+// ========== EXTRACT IP FROM PROXY STRING ==========
 function extractIp(proxyStr) {
     if (!proxyStr) return 'direct';
     const parts = proxyStr.split('://');
@@ -100,7 +76,7 @@ async function sendView() {
     const proxy = proxyPool.length > 0 ? proxyPool[Math.floor(Math.random() * proxyPool.length)] : null;
     const ip = extractIp(proxy);
 
-    // Build proxy agent
+    // Build proxy agent for axios
     let proxyAgent = null;
     if (proxy) {
         const proxyUrl = new URL(proxy);
@@ -154,24 +130,21 @@ function sleep(ms) {
 // ========== MAIN LOOP ==========
 async function main() {
     console.log('='.repeat(60));
-    console.log('🎯 guns.lol View Bot (Node.js + ProxyScrape Free Proxies)');
+    console.log('🎯 guns.lol View Bot (Local http.txt proxies)');
     console.log(`   Target: ${TARGET_URL}`);
     console.log(`   Goal: ${TOTAL_VIEWS} views`);
     console.log(`   Delay: ${DELAY_MS/1000}s`);
     console.log('='.repeat(60));
 
-    console.log('[i] Fetching initial proxy pool...');
-    await refreshProxyPool();
+    console.log(`[i] Loading proxies from ${PROXY_FILE}...`);
+    refreshProxyPool();
     if (proxyPool.length === 0) {
-        console.log('[!] Warning: No proxies loaded. Continuing without proxies (likely blocked).');
+        console.log('[!] No proxies loaded. Exiting.');
+        process.exit(1);
     }
 
     while (!stopFlag && successfulViews < TOTAL_VIEWS) {
         requestCount++;
-        if (requestCount % PROXY_REFRESH_INTERVAL === 0) {
-            console.log('[i] Refreshing proxy pool...');
-            await refreshProxyPool();
-        }
 
         const { success, ip, status } = await sendView();
         if (success) {
