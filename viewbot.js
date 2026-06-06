@@ -472,4 +472,4 @@ client.on('ready', async () => {
     }
 });
 
-client.login(DISCORD_TOKEN);9
+client.login(DISCORD_TOKEN);
