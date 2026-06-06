@@ -1,7 +1,7 @@
 {
   "name": "guns-lol-discord-bot",
   "version": "2.0.0",
-  "description": "Discord bot for guns.lol view bot with extra commands",
+  "description": "Discord bot for guns.lol view bot with extra commands and real browser clicks",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -10,6 +10,9 @@
     "discord.js": "^14.14.1",
     "axios": "^1.6.5",
     "http-proxy-agent": "^7.0.0",
-    "https-proxy-agent": "^7.0.0"
+    "https-proxy-agent": "^7.0.0",
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
